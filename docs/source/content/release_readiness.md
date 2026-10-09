@@ -4,7 +4,7 @@ orphan: true
 
 # Release Readiness — Command-R (Cohere) Model Support
 
-**Status: BLOCKED / NO-GO.** Last updated 2026-10-09. Branch `fix/cohere-rope-qknorm-logit-scale`, code commit `1b7c4a9` (base `main` @ `a4c3648`).
+**Status: BLOCKED / NO-GO.** Last updated 2026-10-09. The ordered list of checks, owners and pass criteria is in [section 9](#9-fastest-path-to-release-readiness). Branch `fix/cohere-rope-qknorm-logit-scale`, code commit `1b7c4a9` (base `main` @ `a4c3648`).
 
 The Command-R fixes below have **not been executed**. No test in this repository has been run against them. Do not release Command-R support, or anything depending on the shared attention bridge changes, until the [exit criteria](#exit-criteria) are met.
 
@@ -312,7 +312,51 @@ Three states, used consistently here, in `Adapters/adapter_support_matrix.xlsx`,
 | Sync with upstream `dev` (PR #1873, Cohere2) | Section 7F | **Not met** |
 | Maintainer notified | No maintainer email address is listed in this repository, in upstream `pyproject.toml`, or in the project mailbox or Drive. Named maintainers: Jonah Larson (primary, per `news/release-3.0.md`), Bryce Meyer (previous). | Open: recipient address needed |
 
-## 9. Recommendation
+## 9. Fastest path to release readiness
+
+### Blocker, re-checked 2026-10-09 18:25 (UTC-5)
+
+The sandbox this work was done in **cannot run any Command-R test**, unit or offline. Checked directly:
+
+| Probe | Result |
+|---|---|
+| `import torch`, `import transformers` under Python 3.11, 3.12 and 3.13 | `ModuleNotFoundError` on all three |
+| Search of the filesystem and both `uv` caches for a `torch` or `transformers` install or wheel | None found |
+| `pip download torch` | "No matching distribution found" |
+| `curl https://pypi.org/simple/torch/` | HTTP 403: "Host not in allowlist: pypi.org. Add this host to your network egress settings to allow access." |
+| `files.pythonhosted.org`, `download.pytorch.org`, `huggingface.co`, `conda.anaconda.org` | Refused or unreachable |
+| Docker | No daemon running |
+| Linked workstation | Not connected |
+
+No code was changed in response. Nothing below has been run.
+
+**To unblock, any one of:** allow `pypi.org` and `files.pythonhosted.org` for the session (add `huggingface.co` for steps 4, 5, 8 and 9); run the steps on a developer machine; or open a pull request from the branch so GitHub Actions runs steps 2, 3, 5, 6 and 7 (it will not run step 4, which is marked `slow`).
+
+### Ordered checks
+
+Run top to bottom and stop at the first failure. Steps 1–3 need no Hugging Face access and take minutes; they are the fastest real signal. Owners are roles: no one has been assigned or has accepted any of these, and the names in brackets are proposals.
+
+| # | Check | Command | Owner | Pass criterion |
+|---|---|---|---|---|
+| 0 | Understand why CI on `main` is red | Read the logs of Actions run 37984279901 | Repository owner [Neil] | Cause of each failing job identified; either fixed or recorded as a known baseline failure with a reason |
+| 1 | Environment builds | `uv sync` | Branch owner [Neil] | Exit code 0 |
+| 2 | Cohere unit tests, including offline parity | `uv run pytest tests/unit/model_bridge/supported_architectures/test_cohere_adapter.py -v` | Branch owner | 0 failed, 0 errors. `TestCohereParity::test_logits_match_hf` reports max abs difference `< 1e-4` |
+| 3 | Offline integration parity (GQA, QK-norm, processed logits) | `uv run pytest tests/integration/model_bridge/test_cohere_adapter.py -v -k Offline` | Branch owner | 0 failed. Both `no_qk_norm` and `qk_norm` variants pass; `test_llama_rotation_diverges_from_hf` passes (the fixture can still detect the bug) |
+| 4 | **Acceptance test** on a real public checkpoint | `uv run pytest tests/integration/model_bridge/test_cohere_adapter.py -v -m slow` | Branch owner | 0 failed. Max abs logit delta `<= 1e-4` at both sequence lengths; layer-0 `resid_pre`, layer-0 attention pattern and final resid each `<= 1e-4`. Log saved |
+| 5 | Remaining Cohere integration tests (Hub tiny model) | `uv run pytest tests/integration/model_bridge/test_cohere_adapter.py -v` | Branch owner | 0 failed |
+| 6 | No regression in adapters sharing the attention bridge | `make test-pr` | Branch owner | 0 failed. Any failure must be reproduced on `main` at `a4c3648` and explained before it is set aside (`AGENTS.md` §10) |
+| 7 | Format and types, pinned tools | `make check-format` and `uv run mypy .` | Branch owner | Both exit 0 |
+| 8 | Registry verification, ungated model | `uv run python -m transformer_lens.tools.model_registry.verify_models --model hyper-accel/tiny-random-cohere` | Branch owner | Phase 1 = 100%, status verified; registry file updated by the tool |
+| 9 | Registry verification, real checkpoint | Same tool, `--model CohereLabs/aya-23-8B` (or a Command-R checkpoint), after `--dry-run` | Someone with a Hugging Face token that has accepted the Cohere licence and about 80 GB of memory. **Unassigned** | Phase 1 = 100%, status verified |
+| 10 | Decide: acceptance against TransformerBridge instead of HookedTransformer | Section 8 | A maintainer. **Unassigned**; raised in the unsent draft | Written decision |
+| 11 | Decide: take upstream PR #1873 by syncing with `dev`, or keep this branch's equivalent | Section 7F | A maintainer. **Unassigned** | Written decision; no duplicate RoPE switch after the sync |
+| 12 | Record the result | `Adapters/adapter_support_matrix.xlsx`; docs copy of the registry | Branch owner | Command-R row changed from "implemented, unverified" to "supported" only after steps 4, 6 and 9 pass, with the log location noted |
+
+**Release gate for Command-R:** steps 1–9 pass and steps 10–12 are closed. Command-R+ additionally needs step 9 repeated on a `use_qk_norm=True` checkpoint, or an explicit "unverified" label.
+
+**If a step fails:** fix on the branch, re-run that step and every earlier one, and do not loosen a tolerance or add a skip to get past it.
+
+## 10. Recommendation
 
 **BLOCKED / NO-GO** for releasing Command-R support and for merging the shared attention bridge change into a release branch.
 
