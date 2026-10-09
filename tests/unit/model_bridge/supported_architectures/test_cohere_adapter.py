@@ -1,7 +1,15 @@
 """Unit tests for CohereArchitectureAdapter: cfg, components, weight conversions, preprocess."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+from transformers.models.cohere.modeling_cohere import (
+    apply_rotary_pos_emb as cohere_apply_rotary_pos_emb,
+)
+from transformers.models.llama.modeling_llama import (
+    apply_rotary_pos_emb as llama_apply_rotary_pos_emb,
+)
 
 from transformer_lens.config import TransformerBridgeConfig
 from transformer_lens.model_bridge.generalized_components import (
@@ -30,6 +38,7 @@ def _make_cfg(
     n_key_value_heads: int | None = 2,
     logit_scale: float | None = 0.0625,
     rope_parameters: dict | None = None,
+    use_qk_norm: bool = False,
 ) -> TransformerBridgeConfig:
     """Minimal TransformerBridgeConfig for Cohere adapter tests."""
     cfg = TransformerBridgeConfig(
@@ -42,6 +51,7 @@ def _make_cfg(
         d_mlp=d_mlp,
         default_prepend_bos=True,
         architecture="CohereForCausalLM",
+        use_qk_norm=use_qk_norm,
     )
     # logit_scale/rope_parameters are dynamic attrs on cfg (not declared on the dataclass).
     if n_key_value_heads is not None:
@@ -319,8 +329,10 @@ class TestCohereAdapterWeightConversions:
         assert adapter.weight_processing_conversions is not None
         assert len(adapter.weight_processing_conversions) == 4
 
+        conversions = dict(adapter.weight_processing_conversions or {})
+
         def _n(key: str) -> int:
-            conv = adapter.weight_processing_conversions[key]  # type: ignore[index]
+            conv = conversions[key]
             assert isinstance(conv, ParamProcessingConversion)
             assert isinstance(conv.tensor_conversion, RearrangeTensorConversion)
             return int(conv.tensor_conversion.axes_lengths["n"])
@@ -412,6 +424,114 @@ class TestCoherePreprocessWeights:
         sd = {"unembed.weight": torch.ones(100, 64, dtype=torch.float16)}
         sd = adapter.preprocess_weights(sd)
         assert sd["unembed.weight"].dtype == torch.float16
+
+
+class TestCohereLogitScaleRuntimeNeutralized:
+    """After the fold, HF's runtime logit_scale multiply must be switched off."""
+
+    def _sd(self) -> dict[str, torch.Tensor]:
+        return {"unembed.weight": torch.ones(10, 64)}
+
+    def test_runtime_scale_reset_after_fold(self) -> None:
+        adapter = CohereArchitectureAdapter(_make_cfg(logit_scale=0.5))
+        hf_model = SimpleNamespace(logit_scale=0.5)
+        adapter.preprocess_weights(self._sd())
+        adapter.finalize_weight_processing(hf_model)
+        assert hf_model.logit_scale == 1.0
+
+    def test_runtime_scale_untouched_without_fold(self) -> None:
+        # Unprocessed bridges rely on HF's multiply; it must survive.
+        adapter = CohereArchitectureAdapter(_make_cfg(logit_scale=0.5))
+        hf_model = SimpleNamespace(logit_scale=0.5)
+        adapter.finalize_weight_processing(hf_model)
+        assert hf_model.logit_scale == 0.5
+
+    def test_committed_fold_is_not_repeated(self) -> None:
+        adapter = CohereArchitectureAdapter(_make_cfg(logit_scale=0.5))
+        hf_model = SimpleNamespace(logit_scale=0.5)
+        sd = adapter.preprocess_weights(self._sd())
+        adapter.finalize_weight_processing(hf_model)
+        sd = adapter.preprocess_weights(sd)
+        adapter.finalize_weight_processing(hf_model)
+        assert torch.allclose(sd["unembed.weight"], torch.full((10, 64), 0.5))
+        assert hf_model.logit_scale == 1.0
+
+    def test_uncommitted_fold_is_retried(self) -> None:
+        # process_weights failed before finalize: the weights were never written,
+        # so the next attempt must fold again rather than drop the scale.
+        adapter = CohereArchitectureAdapter(_make_cfg(logit_scale=0.5))
+        adapter.preprocess_weights(self._sd())
+        sd = adapter.preprocess_weights(self._sd())
+        assert torch.allclose(sd["unembed.weight"], torch.full((10, 64), 0.5))
+
+    def test_runtime_scale_kept_when_nothing_was_folded(self) -> None:
+        adapter = CohereArchitectureAdapter(_make_cfg(logit_scale=0.5))
+        hf_model = SimpleNamespace(logit_scale=0.5)
+        adapter.preprocess_weights({"embed.weight": torch.ones(10, 64)})
+        adapter.finalize_weight_processing(hf_model)
+        assert hf_model.logit_scale == 0.5
+
+
+class TestCohereRotaryConvention:
+    """The attention bridge must rotate adjacent pairs, as HF Cohere does."""
+
+    @staticmethod
+    def _inputs(d_head: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        torch.manual_seed(0)
+        q = torch.randn(1, 4, 6, d_head)
+        k = torch.randn(1, 2, 6, d_head)
+        # Interleaved layout, as CohereRotaryEmbedding builds it.
+        angles = torch.repeat_interleave(torch.rand(1, 6, d_head // 2) * 3.0, 2, dim=-1)
+        return q, k, angles.cos(), angles.sin()
+
+    def _attn(self, adapter: CohereArchitectureAdapter) -> PositionEmbeddingsAttentionBridge:
+        attn = adapter.component_mapping["blocks"].submodules["attn"]
+        assert isinstance(attn, PositionEmbeddingsAttentionBridge)
+        return attn
+
+    def test_matches_hf_cohere_rotation(self, adapter: CohereArchitectureAdapter) -> None:
+        q, k, cos, sin = self._inputs(d_head=8)
+        q_rot, k_rot = self._attn(adapter)._apply_rotary(q, k, cos, sin)
+        hf_q, hf_k = cohere_apply_rotary_pos_emb(q, k, cos, sin)
+        assert torch.allclose(q_rot, hf_q, atol=1e-6)
+        assert torch.allclose(k_rot, hf_k, atol=1e-6)
+
+    def test_differs_from_llama_rotation_when_d_head_above_two(
+        self, adapter: CohereArchitectureAdapter
+    ) -> None:
+        q, k, cos, sin = self._inputs(d_head=8)
+        q_rot, _ = self._attn(adapter)._apply_rotary(q, k, cos, sin)
+        llama_q, _ = llama_apply_rotary_pos_emb(q, k, cos, sin)
+        assert (q_rot - llama_q).abs().max().item() > 1e-2
+
+    def test_conventions_coincide_at_d_head_two(self, adapter: CohereArchitectureAdapter) -> None:
+        # Why a d_head=2 test model cannot catch a wrong convention.
+        q, k, cos, sin = self._inputs(d_head=2)
+        q_rot, _ = self._attn(adapter)._apply_rotary(q, k, cos, sin)
+        llama_q, _ = llama_apply_rotary_pos_emb(q, k, cos, sin)
+        assert torch.allclose(q_rot, llama_q, atol=1e-6)
+
+
+class TestCohereQKNorm:
+    """q_norm/k_norm are declared exactly when the checkpoint has them (Command-R+)."""
+
+    def test_absent_by_default(self, adapter: CohereArchitectureAdapter) -> None:
+        attn = adapter.component_mapping["blocks"].submodules["attn"]
+        assert "q_norm" not in attn.submodules
+        assert "k_norm" not in attn.submodules
+        assert not hasattr(attn, "hook_q_normed")
+
+    def test_declared_when_use_qk_norm(self) -> None:
+        adapter = CohereArchitectureAdapter(_make_cfg(use_qk_norm=True))
+        attn = adapter.component_mapping["blocks"].submodules["attn"]
+        for norm_name in ("q_norm", "k_norm"):
+            norm = attn.submodules[norm_name]
+            assert isinstance(norm, NormalizationBridge)
+            assert norm.name == norm_name
+            # CohereLayerNorm subtracts the mean; it must not be treated as RMSNorm.
+            assert norm.uses_rms_norm is False
+        assert hasattr(attn, "hook_q_normed")
+        assert hasattr(attn, "hook_k_normed")
 
 
 class TestCohereArchitectureGuards:

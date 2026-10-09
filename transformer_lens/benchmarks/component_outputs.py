@@ -757,6 +757,13 @@ class ComponentBenchmarker:
             d_head = self.cfg.d_head
             # Use just d_head dimensions as test input
             test_input_reshaped = test_input[..., :d_head]
+            # Per-head norms (Cohere, weight [heads, d_head]) take [batch, seq, heads, d_head].
+            norm_weight = getattr(component, "weight", None)
+            if isinstance(norm_weight, torch.Tensor) and norm_weight.ndim == 2:
+                n_norm_heads = norm_weight.shape[0]
+                test_input_reshaped = (
+                    test_input_reshaped.unsqueeze(2).expand(-1, -1, n_norm_heads, -1).contiguous()
+                )
             return component(test_input_reshaped)
 
         # Use shared inputs if provided (generated from bridge component's get_random_inputs())

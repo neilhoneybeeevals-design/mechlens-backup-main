@@ -144,7 +144,9 @@ def preprocess_weights(self, state_dict: dict[str, torch.Tensor]) -> dict[str, t
     return state_dict
 ```
 
-**Skip the override when:** the op lives inside an HF submodule the bridge delegates to (e.g. RoPE inside `CohereRotaryEmbedding`) — HF forward applies it on both paths, parity is free.
+**Skip the override when:** the op lives inside an HF submodule the bridge delegates to (e.g. cos/sin generation inside a rotary-embedding module) — HF forward applies it on both paths, parity is free. Check that the bridge really delegates: `PositionEmbeddingsAttentionBridge` **reimplements** attention (Q/K norm, RoPE rotation, GQA, softmax), so anything HF does inside `<Arch>Attention.forward` must be reproduced there, not assumed.
+
+**Pair every fold with `finalize_weight_processing`** when HF applies the op from a runtime attribute rather than a weight. The bridge forward still runs the HF model's `forward`, so a folded scale is applied twice unless the adapter neutralizes the runtime copy (Cohere sets `hf_model.logit_scale = 1.0` after folding).
 
 **Verification:** a missing fold degrades Phase 4 (text-generation), and Phase 3 if severe enough to trip the strict gate. P4's 50% bar is intentionally lenient, so sub-100% P4 on a small parity-test model is worth investigating even with `STATUS_VERIFIED`. See [tools/model_registry/AGENTS.md §Phase-score thresholds](../../tools/model_registry/AGENTS.md#phase-score-thresholds).
 
@@ -235,6 +237,8 @@ Failure message names the missing set. (`INTENTIONAL_EXCLUDES` in the test handl
 | HF convention | Handled in | How |
 |---|---|---|
 | RoPE (rotary positional embeddings) | `llama.py`, `mistral.py`, `qwen2.py`+ | `RotaryEmbeddingBridge(name="model.rotary_emb")` + `cfg.positional_embedding_type = "rotary"` |
+| RoPE pairing adjacent dims (`repeat_interleave` cos/sin, `x[..., ::2]` rotate) | `cohere.py` | `PositionEmbeddingsAttentionBridge(..., rotary_interleaved=True)`. The default is Llama's half-split rotation; the two agree only when `d_head == 2` |
+| Per-head QK LayerNorm (weight `[n_heads, d_head]`) | `cohere.py` (`use_qk_norm`, Command-R+) | Declare `q_norm` / `k_norm` submodules; the bridge applies them on `[B, S, H, D]` before the transpose |
 | GQA / MQA (`n_key_value_heads < n_heads`) | `llama.py`, `mistral.py`, `falcon.py`, `cohere.py` | Set `cfg.n_key_value_heads`; pass `n_kv_heads=` to `_qkvo_weight_conversions()` |
 | RMSNorm with offset | `gemma1.py`, `gemma2.py`, `gemma3.py` | `cfg.rmsnorm_uses_offset = True` + `ArithmeticTensorConversion(ADDITION, 1.0)` |
 | Standard LayerNorm | `gpt2.py`, `bloom.py` | `cfg.normalization_type = "LN"` |
@@ -347,6 +351,8 @@ def bridge():
         "<hf_repo>", device="cpu", dtype=torch.float32, attn_implementation="eager",
     )
 ```
+
+**Parity models must not be degenerate.** A tiny Hub model with `d_head == 2` cannot distinguish RoPE conventions, and default-init weights give near-uniform attention that hides attention bugs. When the Hub tiny model is degenerate, add an offline case built from `<Arch>Config` + `build_bridge_from_module` with `d_head >= 4`, GQA, and re-scaled weights (see `_offline_cohere` in [`test_cohere_adapter.py`](../../../tests/integration/model_bridge/test_cohere_adapter.py)), and compare attention patterns as well as logits.
 
 If the reference model OOMs CI, gate with `@pytest.mark.skipif(bool(os.getenv("CI")), ...)` and add a row to [`QUARANTINES.md`](../../../tests/QUARANTINES.md) under "CI cost / network budget."
 

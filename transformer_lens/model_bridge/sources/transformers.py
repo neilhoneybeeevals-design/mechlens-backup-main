@@ -186,6 +186,9 @@ def map_default_transformer_lens_config(hf_config):
         tl_config.experts_per_token = source_config.num_experts_per_tok
     if hasattr(source_config, "sliding_window") and source_config.sliding_window is not None:
         tl_config.sliding_window = source_config.sliding_window
+    # Cohere: HF name equals the declared TL field, so map it here (not PASSTHROUGH).
+    if getattr(source_config, "use_qk_norm", None) is not None:
+        tl_config.use_qk_norm = bool(source_config.use_qk_norm)
     if getattr(hf_config, "use_parallel_residual", False):
         tl_config.parallel_attn_mlp = True
     # GPT-J and CodeGen: parallel attn+MLP but missing use_parallel_residual in HF config

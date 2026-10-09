@@ -748,6 +748,18 @@ class ArchitectureAdapter:
         """
         pass
 
+    def finalize_weight_processing(self, hf_model: Any) -> None:
+        """Called after processed weights have been written back into the model.
+
+        Override when ``preprocess_weights`` folds an operation that the HF
+        forward also applies at runtime (e.g. Cohere's ``logit_scale``), so the
+        runtime copy can be neutralized instead of being applied twice.
+
+        Args:
+            hf_model: The wrapped HuggingFace model instance
+        """
+        pass
+
     def create_stateful_cache(
         self,
         hf_model: Any,

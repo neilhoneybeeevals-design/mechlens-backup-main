@@ -123,8 +123,17 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
         requires_attention_mask: bool = True,
         requires_position_embeddings: bool = True,
         is_causal: bool = True,
+        rotary_interleaved: bool = False,
         **kwargs,  # absorb any other AttentionBridge kwargs callers may pass
     ):
+        """Initialize the bridge.
+
+        Args:
+            rotary_interleaved: RoPE pairing convention. False (default) rotates
+                dim ``i`` with ``i + d/2`` (Llama). True rotates adjacent dims
+                ``2i`` / ``2i + 1`` (Cohere), matching rotary modules that build
+                cos/sin with ``repeat_interleave``.
+        """
         super().__init__(
             name,
             config,
@@ -144,6 +153,7 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
         if submodules is not None and "k_norm" in submodules:
             self.hook_k_normed = HookPoint()
         self._qk_norm_phase: Optional[str] = None
+        self._rotary_interleaved = rotary_interleaved
 
     def set_original_component(self, component: torch.nn.Module) -> None:
         """Wire HF module, register for rotary hooks, validate adapter declarations."""
@@ -174,7 +184,8 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
                     f"'{norm_name}' but adapter did not declare it. Forward would "
                     f"skip the norm, producing wrong logits vs HF. Add "
                     f"'{norm_name}': RMSNormalizationBridge(name='{norm_name}', "
-                    f"config=self.cfg) to the attention submodules."
+                    f"config=self.cfg) (NormalizationBridge for LayerNorm-style "
+                    f"norms) to the attention submodules."
                 )
 
     def _decide_qk_norm_phase(self, hf_attn: torch.nn.Module) -> Optional[str]:
@@ -204,9 +215,10 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
             return "post_reshape"
         if n_heads and shape == (n_heads * head_dim,):
             return "pre_reshape"
-        # Per-head norm (Cohere) broadcasts on the reshaped [B,H,S,D] tensor.
+        # Per-head norm (Cohere): [H, D] weight only broadcasts on [B, S, H, D],
+        # so it must run before the head/seq transpose.
         if n_heads and shape == (n_heads, head_dim):
-            return "post_reshape"
+            return "per_head"
         raise RuntimeError(
             f"{self.name}: cannot determine QK-norm phase from q_norm weight "
             f"shape {shape} (head_dim={head_dim}, n_heads={n_heads}). Expected "
@@ -233,6 +245,32 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
             normed = hook(norm_module(flat))
             return normed.view(b, s, h, d)
         return hook(norm_module(tensor))
+
+    def _apply_rotary(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate Q/K ([B, H, S, D]) using the architecture's RoPE pairing convention."""
+        if not self._rotary_interleaved:
+            from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+            return apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # Mirrors HF Cohere's apply_rotary_pos_emb, including its fp32 upcast.
+        def rotate_adjacent(x: torch.Tensor) -> torch.Tensor:
+            return torch.stack([-x[..., 1::2], x[..., ::2]], dim=-1).flatten(-2)
+
+        dtype = query_states.dtype
+        q = query_states.float()
+        k = key_states.float()
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        q_embed = (q * cos) + (rotate_adjacent(q) * sin)
+        k_embed = (k * cos) + (rotate_adjacent(k) * sin)
+        return q_embed.to(dtype=dtype), k_embed.to(dtype=dtype)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Reimplemented forward pass with hooks at correct computation stages.
@@ -365,16 +403,22 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
 
         # For the split path, tensors are already [B, S, H, d_head]; for the
         # default path they're flat [B, S, H*d_head] and need the view.
-        if split_active:
-            query_states = query_states.transpose(1, 2)
-            key_states = key_states.transpose(1, 2)
-            value_states = value_states.transpose(1, 2)
-        else:
-            query_states = query_states.view(hidden_shape).transpose(1, 2)
-            key_states = key_states.view(hidden_shape).transpose(1, 2)
-            value_states = value_states.view(hidden_shape).transpose(1, 2)
+        if not split_active:
+            query_states = query_states.view(hidden_shape)
+            key_states = key_states.view(hidden_shape)
+            value_states = value_states.view(hidden_shape)
 
-        # Post-reshape phase (Gemma-3/Cohere): norm on [B, H, S, D].
+        # Per-head phase (Cohere): norm on [B, S, H, D], before the transpose.
+        if has_q_norm and self._qk_norm_phase == "per_head":
+            query_states = self.hook_q_normed(self.q_norm(query_states))
+            if has_k_norm:
+                key_states = self.hook_k_normed(self.k_norm(key_states))
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        # Post-reshape phase (Gemma-3): norm on [B, H, S, D].
         if has_q_norm and self._qk_norm_phase == "post_reshape":
             query_states = self.hook_q_normed(self.q_norm(query_states))
             if has_k_norm:
@@ -384,7 +428,6 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
         if position_embeddings is not None:
             position_embeddings = self._apply_position_embedding_hooks(position_embeddings)
             cos, sin = position_embeddings
-            from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
             # Some models use partial rotary (e.g., GPT-OSS) where cos/sin cover only
             # a portion of head_dim. Split Q/K, rotate the partial dims, recombine.
@@ -392,11 +435,11 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
             if rotary_dim < head_dim:
                 q_rot, q_pass = query_states[..., :rotary_dim], query_states[..., rotary_dim:]
                 k_rot, k_pass = key_states[..., :rotary_dim], key_states[..., rotary_dim:]
-                q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+                q_rot, k_rot = self._apply_rotary(q_rot, k_rot, cos, sin)
                 query_states = torch.cat([q_rot, q_pass], dim=-1)
                 key_states = torch.cat([k_rot, k_pass], dim=-1)
             else:
-                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                query_states, key_states = self._apply_rotary(query_states, key_states, cos, sin)
 
         # Fire hook_rot_q/hook_rot_k (post-rotation)
         if hasattr(self, "hook_rot_q"):

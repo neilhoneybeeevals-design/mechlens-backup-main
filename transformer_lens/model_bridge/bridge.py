@@ -992,6 +992,10 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
             component_mapping=self.real_components,
         )
 
+        # Folds that HF also applies at runtime must be switched off on the model.
+        if adapter and hasattr(adapter, "finalize_weight_processing"):
+            adapter.finalize_weight_processing(self.original_model)
+
     def _calculate_loss(self, logits, tokens, loss_per_token=False):
         """Calculate cross-entropy loss."""
         shift_logits = logits[..., :-1, :].contiguous()

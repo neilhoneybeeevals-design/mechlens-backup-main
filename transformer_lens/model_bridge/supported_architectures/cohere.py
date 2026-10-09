@@ -7,7 +7,9 @@ Supports CohereForCausalLM models (Command-R family) with:
 - Gated SwiGLU MLP (gate_proj, up_proj, down_proj)
 - Logit scaling: output logits multiplied by config.logit_scale (default 1/16)
 - Tied embed/unembed weights by default (tie_word_embeddings=True)
-- Interleaved RoPE via CohereRotaryEmbedding (delegated to HF module)
+- Interleaved RoPE: cos/sin come from CohereRotaryEmbedding; the attention bridge
+  applies them with Cohere's adjacent-pair rotation (rotary_interleaved=True)
+- Optional per-head QK LayerNorm (use_qk_norm=True, e.g. Command-R+)
 """
 
 from typing import Any
@@ -25,6 +27,9 @@ from transformer_lens.model_bridge.generalized_components import (
     RotaryEmbeddingBridge,
     UnembeddingBridge,
 )
+from transformer_lens.model_bridge.generalized_components.base import (
+    GeneralizedComponent,
+)
 
 
 class CohereArchitectureAdapter(ArchitectureAdapter):
@@ -36,8 +41,14 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
     - CohereLayerNorm is true LayerNorm (mean-subtracting), NOT RMSNorm.
       It has a weight parameter but NO bias parameter.
     - Logit scale: CohereForCausalLM.forward multiplies logits by logit_scale
-      (default 0.0625 = 1/16). Folded into unembed.weight via preprocess_weights.
-    - Rotary embeddings use repeat_interleave instead of cat-split (delegated to HF).
+      (default 0.0625 = 1/16). Folded into unembed.weight via preprocess_weights;
+      finalize_weight_processing then resets the HF runtime multiply so the scale
+      is not applied twice.
+    - Rotary embeddings pair adjacent dims (2i, 2i+1) instead of Llama's (i, i+d/2).
+      The attention bridge reimplements attention, so it must be told the
+      convention; Llama's rotation silently diverges from HF once d_head > 2.
+    - use_qk_norm=True adds q_norm/k_norm (CohereLayerNorm, weight [heads, d_head])
+      applied per head before RoPE.
 
     Optional parameters (absent from state_dict by default):
     - blocks.{i}.attn.b_Q/b_K/b_V/b_O — no bias on projections (attention_bias=False)
@@ -91,8 +102,10 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
         # so cfg.logit_scale is always a plain float (never None).
         # logit_scale is not a declared field on TransformerBridgeConfig; it is a
         # Cohere-specific dynamic attribute accessed later in preprocess_weights.
+        self._logit_scale_folded = False
+        self._logit_scale_fold_pending = False
         _ls = getattr(cfg, "logit_scale", None)
-        self.cfg.logit_scale = float(_ls) if _ls is not None else 0.0625  # type: ignore[attr-defined]
+        setattr(self.cfg, "logit_scale", float(_ls) if _ls is not None else 0.0625)
 
         # --- RoPE theta (informational metadata) ---
         # CohereRotaryEmbedding reads config.rope_parameters["rope_theta"] directly;
@@ -105,17 +118,36 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
             _theta = getattr(cfg, "default_theta", 10000.0)
         self.cfg.rotary_base = int(_theta)
 
+        # --- QK-norm (Command-R+) ---
+        # The attention bridge refuses to wrap an HF module whose q_norm/k_norm are
+        # undeclared, so these must be mapped whenever the checkpoint has them.
+        use_qk_norm = bool(getattr(cfg, "use_qk_norm", False))
+        self.cfg.use_qk_norm = use_qk_norm
+        attn_submodules: dict[str, GeneralizedComponent] = {
+            "q": LinearBridge(name="q_proj"),
+            "k": LinearBridge(name="k_proj"),
+            "v": LinearBridge(name="v_proj"),
+            "o": LinearBridge(name="o_proj"),
+        }
+        if use_qk_norm:
+            # Native forward: CohereLayerNorm owns the [heads, d_head] weight broadcast.
+            attn_submodules["q_norm"] = NormalizationBridge(
+                name="q_norm", config=self.cfg, use_native_layernorm_autograd=True
+            )
+            attn_submodules["k_norm"] = NormalizationBridge(
+                name="k_norm", config=self.cfg, use_native_layernorm_autograd=True
+            )
+
         # --- Component mapping ---
         # Block structure follows Falcon's parallel_attn=True, num_ln_in_parallel_attn=1
         # mode: single ln1 feeds both attn and MLP; NO ln2.
         # Submodule shapes follow Llama: separate q/k/v/o projections and SwiGLU MLP.
-        # Rotary and attention both delegate to HF modules, preserving Cohere's
-        # repeat_interleave RoPE convention without re-implementing it in TL.
+        # cos/sin come from HF's CohereRotaryEmbedding; the rotation itself runs in
+        # the attention bridge, which is why rotary_interleaved=True is required.
         self.component_mapping = {
             # Embedding: model.embed_tokens (same root as Llama, not transformer.* like Falcon)
             "embed": EmbeddingBridge(name="model.embed_tokens"),
             # Rotary embedding: top-level, delegates to CohereRotaryEmbedding.
-            # Pattern matches llama.py:75 and falcon.py:154 — NOT inside blocks.
             "rotary_emb": RotaryEmbeddingBridge(name="model.rotary_emb", config=self.cfg),
             "blocks": ParallelBlockBridge(
                 name="model.layers",
@@ -129,18 +161,12 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
                     "attn": PositionEmbeddingsAttentionBridge(
                         name="self_attn",
                         config=self.cfg,
-                        submodules={
-                            "q": LinearBridge(name="q_proj"),
-                            "k": LinearBridge(name="k_proj"),
-                            "v": LinearBridge(name="v_proj"),
-                            "o": LinearBridge(name="o_proj"),
-                        },
+                        submodules=attn_submodules,
                         requires_attention_mask=True,
                         requires_position_embeddings=True,
+                        rotary_interleaved=True,
                     ),
                     # GatedMLPBridge: gate/in/out matches Llama's gate_proj/up_proj/down_proj.
-                    # Optional use_qk_norm is handled transparently by HF's
-                    # CohereAttention.forward delegation (no extra submodules needed).
                     "mlp": GatedMLPBridge(
                         name="mlp",
                         config=self.cfg,
@@ -161,26 +187,43 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
     def preprocess_weights(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Fold logit_scale into unembed weights before ProcessWeights runs.
 
-        bridge.py lines 726-732 clone unembed.weight before calling this, so
-        scaling does not affect the tied embed.weight.
-        logit_scale=1.0 is a no-op (skipped for efficiency).
+        The bridge clones unembed.weight before calling this, so scaling does not
+        affect the tied embed.weight. logit_scale=1.0 is a no-op.
+
+        Skipped once a previous fold has been committed to the model;
+        finalize_weight_processing commits it and switches off HF's runtime multiply.
         """
         scale: float = getattr(self.cfg, "logit_scale")  # always set by __init__
-        if scale != 1.0:
-            for key in ("unembed.weight", "unembed.bias"):
-                if key in state_dict:
-                    orig_dtype = state_dict[key].dtype
-                    state_dict[key] = (state_dict[key].float() * scale).to(orig_dtype)
+        self._logit_scale_fold_pending = False
+        if scale == 1.0 or self._logit_scale_folded:
+            return state_dict
+        if "unembed.weight" not in state_dict:
+            return state_dict
+        for key in ("unembed.weight", "unembed.bias"):
+            if key in state_dict:
+                orig_dtype = state_dict[key].dtype
+                state_dict[key] = (state_dict[key].float() * scale).to(orig_dtype)
+        self._logit_scale_fold_pending = True
         return state_dict
+
+    def finalize_weight_processing(self, hf_model: Any) -> None:
+        """Stop HF from re-applying a logit_scale that now lives in unembed.weight.
+
+        The bridge forward runs CohereForCausalLM.forward, which multiplies logits
+        by ``hf_model.logit_scale``. Left alone after the fold, processed logits
+        come out scaled by logit_scale**2.
+        """
+        # Committed only here, so a failed process_weights can be retried cleanly.
+        if self._logit_scale_fold_pending and hasattr(hf_model, "logit_scale"):
+            hf_model.logit_scale = 1.0
+            self._logit_scale_folded = True
+        self._logit_scale_fold_pending = False
 
     def setup_component_testing(self, hf_model: Any, bridge_model: Any = None) -> None:
         """Set rotary embedding reference on attention bridges for component testing.
 
-        CohereRotaryEmbedding lives at hf_model.model.rotary_emb. The bridge
-        delegates to it directly, preserving the repeat_interleave RoPE convention
-        without re-implementing it in TL.
-
-        Pattern matches llama.py and qwen2.py.
+        CohereRotaryEmbedding lives at hf_model.model.rotary_emb and supplies the
+        interleaved cos/sin that the attention bridge rotates Q/K with.
         """
         rotary_emb = hf_model.model.rotary_emb
 

@@ -6,23 +6,28 @@ Model: trl-internal-testing/tiny-CohereForCausalLM
   - logit_scale=0.125 (canonical Command-R is 0.0625; tiny diverges so
     regression tests catch silent-fallback bugs in the passthrough)
 
-NOTE: The tiny model has use_qk_norm=False, so QK-norm is not exercised here.
-Cohere's QK-norm is a per-head LayerNorm inside CohereAttention.forward; it is
-handled via HF delegation (PositionEmbeddingsAttentionBridge calls the original
-CohereAttention.forward directly), so functional correctness for that path relies
-on the same delegation mechanism verified in test_forward_matches_hf.
+NOTE: The Hub tiny model cannot validate attention on its own. It has d_head=2,
+where Cohere's adjacent-pair RoPE and Llama's half-split RoPE are the same
+rotation, and use_qk_norm=False. PositionEmbeddingsAttentionBridge reimplements
+attention (it does not call CohereAttention.forward), so both paths are covered
+by the offline classes at the bottom of this file, which build random
+CohereForCausalLM models with d_head=8, GQA, and optional QK-norm.
 """
 
+import copy
 from typing import Any
 
 import pytest
 import torch
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, CohereConfig, CohereForCausalLM
 
 from transformer_lens.model_bridge.bridge import TransformerBridge
 from transformer_lens.model_bridge.generalized_components import NormalizationBridge
 from transformer_lens.model_bridge.generalized_components.position_embeddings_attention import (
     PositionEmbeddingsAttentionBridge,
+)
+from transformer_lens.model_bridge.sources._bridge_builder import (
+    build_bridge_from_module,
 )
 
 MODEL = "trl-internal-testing/tiny-CohereForCausalLM"
@@ -153,7 +158,7 @@ class TestCohereForwardEquivalence:
         assert not torch.isinf(output).any()
 
     def test_forward_matches_hf(self, cohere_bridge: TransformerBridge, cohere_hf: Any) -> None:
-        """Bridge delegates to HF native forward — logits should be identical."""
+        """Unprocessed bridge logits must match HF."""
         tokens = torch.tensor([[1, 2, 3, 4]])
         with torch.no_grad():
             bridge_out = cohere_bridge(tokens)
@@ -191,22 +196,34 @@ class TestCohereLogitScaleEndToEnd:
             f"logit_scale={logit_scale}"
         )
 
-    def test_logit_scale_folded_not_applied_twice(
+    def test_logit_scale_not_folded_before_process_weights(
         self, cohere_bridge: TransformerBridge, cohere_hf: Any
     ) -> None:
-        """Confirm logit_scale isn't double-applied.
-
-        The bridge (before process_weights) delegates to HF's forward, which includes
-        the logit_scale multiply. If forward still matches HF, the fold hasn't been
-        applied a second time on top of HF's own scale.
-        """
+        """Before process_weights only HF's runtime multiply applies the scale."""
         tokens = torch.tensor([[1, 2, 3, 4]])
         with torch.no_grad():
             bridge_out = cohere_bridge(tokens)
             hf_out = cohere_hf(tokens).logits
-        # If logit_scale were applied twice, outputs would differ by a factor of 16
         max_diff = (bridge_out - hf_out).abs().max().item()
         assert max_diff < 1e-4, f"Possible double-application of logit_scale; diff={max_diff:.6f}"
+
+    def test_processed_forward_matches_hf(
+        self, cohere_bridge_processed: TransformerBridge, cohere_hf: Any
+    ) -> None:
+        """Regression: after the fold, HF's runtime multiply must not apply the scale again.
+
+        The forward still runs CohereForCausalLM.forward. If its logit_scale were
+        left in place the processed logits would be logit_scale times too small.
+        """
+        tokens = torch.tensor([[1, 2, 3, 4]])
+        with torch.no_grad():
+            bridge_out = cohere_bridge_processed(tokens)
+            hf_out = cohere_hf(tokens).logits
+        assert torch.allclose(bridge_out, hf_out, rtol=1e-3, atol=1e-6), (
+            "Processed logits diverge from HF (logit_scale applied twice?): "
+            f"max_diff={(bridge_out - hf_out).abs().max().item():.6g}, "
+            f"hf_max={hf_out.abs().max().item():.6g}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +259,7 @@ class TestCohereTiedEmbedding:
         # cfg.logit_scale is set before process_weights so the fold (which reads it
         # inside preprocess_weights) runs with the parametrized value.
         bridge = TransformerBridge.boot_transformers(MODEL, device="cpu")
-        bridge.cfg.logit_scale = logit_scale  # type: ignore[attr-defined]
+        setattr(bridge.cfg, "logit_scale", logit_scale)
         bridge.process_weights(
             fold_ln=False,
             center_writing_weights=False,
@@ -332,3 +349,140 @@ class TestCohereParallelHooks:
         for i in range(2):
             assert f"blocks.{i}.hook_resid_pre" in cache
             assert f"blocks.{i}.hook_resid_post" in cache
+
+
+# ---------------------------------------------------------------------------
+# 7. Offline parity on a non-degenerate model (d_head=8, GQA, optional QK-norm)
+# ---------------------------------------------------------------------------
+
+OFFLINE_TOKENS = torch.tensor([[1, 5, 9, 13, 17, 21, 25, 29]])
+
+
+def _offline_cohere(use_qk_norm: bool) -> tuple[TransformerBridge, Any]:
+    """Bridge + independent HF reference for a random CohereForCausalLM (no Hub access).
+
+    Weights are re-drawn at a larger scale than HF's init so attention scores are
+    O(1); with the default init attention is near-uniform and RoPE errors vanish.
+    """
+    torch.manual_seed(0)
+    cfg = CohereConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        logit_scale=0.125,
+        use_qk_norm=use_qk_norm,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        attn_implementation="eager",
+    )
+    hf_reference = CohereForCausalLM(cfg).eval()
+    with torch.no_grad():
+        for name, param in hf_reference.named_parameters():
+            if "norm" in name:
+                param.uniform_(0.5, 1.5)
+            else:
+                param.normal_(mean=0.0, std=0.2)
+    hf_reference.config._attn_implementation = "eager"
+    for layer in hf_reference.model.layers:
+        layer.self_attn.config._attn_implementation = "eager"
+
+    hf_model = CohereForCausalLM(copy.deepcopy(cfg)).eval()
+    hf_model.load_state_dict(hf_reference.state_dict())
+    bridge = build_bridge_from_module(
+        hf_model,
+        "CohereForCausalLM",
+        hf_config=copy.deepcopy(cfg),
+        tokenizer=None,
+        device="cpu",
+    ).eval()
+    bridge.adapter.setup_component_testing(hf_model, bridge_model=bridge)
+    return bridge, hf_reference
+
+
+@pytest.fixture(scope="module", params=[False, True], ids=["no_qk_norm", "qk_norm"])
+def offline_cohere(request: pytest.FixtureRequest) -> tuple[TransformerBridge, Any]:
+    return _offline_cohere(use_qk_norm=request.param)
+
+
+class TestCohereOfflineParity:
+    """Logit and attention-pattern parity where the RoPE convention matters."""
+
+    def test_fixture_exercises_rope_and_gqa(
+        self, offline_cohere: tuple[TransformerBridge, Any]
+    ) -> None:
+        bridge, hf_reference = offline_cohere
+        # d_head must exceed 2 or the two RoPE conventions are indistinguishable.
+        assert bridge.cfg.d_head == 8
+        assert bridge.cfg.n_key_value_heads == 2
+        assert bridge.cfg.use_qk_norm == hf_reference.config.use_qk_norm
+
+    def test_forward_matches_hf(self, offline_cohere: tuple[TransformerBridge, Any]) -> None:
+        bridge, hf_reference = offline_cohere
+        with torch.no_grad():
+            bridge_out = bridge(OFFLINE_TOKENS)
+            hf_out = hf_reference(OFFLINE_TOKENS).logits
+        assert bridge_out.shape == hf_out.shape
+        # Guard against a degenerate reference where any output would "match".
+        assert hf_out.abs().max().item() > 1e-2
+        max_diff = (bridge_out - hf_out).abs().max().item()
+        assert max_diff < 1e-4, f"Bridge vs HF max diff = {max_diff:.6f}"
+
+    def test_attention_pattern_matches_hf(
+        self, offline_cohere: tuple[TransformerBridge, Any]
+    ) -> None:
+        bridge, hf_reference = offline_cohere
+        with torch.no_grad():
+            _, cache = bridge.run_with_cache(OFFLINE_TOKENS)
+            hf_attentions = hf_reference(OFFLINE_TOKENS, output_attentions=True).attentions
+        for i, hf_pattern in enumerate(hf_attentions):
+            pattern = cache[f"blocks.{i}.attn.hook_pattern"]
+            max_diff = (pattern - hf_pattern).abs().max().item()
+            assert max_diff < 1e-4, f"Layer {i} attention pattern max diff = {max_diff:.6f}"
+
+    def test_qk_norm_hooks_fire_only_when_enabled(
+        self, offline_cohere: tuple[TransformerBridge, Any]
+    ) -> None:
+        bridge, hf_reference = offline_cohere
+        _, cache = bridge.run_with_cache(OFFLINE_TOKENS)
+        fired = "blocks.0.attn.hook_q_normed" in cache
+        assert fired == bool(hf_reference.config.use_qk_norm)
+
+    def test_llama_rotation_diverges_from_hf(self) -> None:
+        """The fixture must be able to detect the wrong RoPE convention.
+
+        Forcing Llama's half-split rotation onto this model reproduces the original
+        defect; if this stops diverging, the parity tests above have gone blind.
+        """
+        bridge, hf_reference = _offline_cohere(use_qk_norm=False)
+        for block in bridge.blocks:
+            block.attn._rotary_interleaved = False
+        with torch.no_grad():
+            bridge_out = bridge(OFFLINE_TOKENS)
+            hf_out = hf_reference(OFFLINE_TOKENS).logits
+        max_diff = (bridge_out - hf_out).abs().max().item()
+        assert max_diff > 1e-3, f"Half-split RoPE unexpectedly matches HF (diff={max_diff:.6f})"
+
+
+class TestCohereOfflineProcessedLogitScale:
+    """logit_scale must be applied exactly once after process_weights."""
+
+    def test_processed_forward_matches_hf(self) -> None:
+        bridge, hf_reference = _offline_cohere(use_qk_norm=False)
+        bridge.process_weights(
+            fold_ln=False,
+            center_writing_weights=False,
+            center_unembed=False,
+            fold_value_biases=False,
+            refactor_factored_attn_matrices=False,
+        )
+        with torch.no_grad():
+            bridge_out = bridge(OFFLINE_TOKENS)
+            hf_out = hf_reference(OFFLINE_TOKENS).logits
+        max_diff = (bridge_out - hf_out).abs().max().item()
+        assert max_diff < 1e-4, f"Processed bridge vs HF max diff = {max_diff:.6f}"
