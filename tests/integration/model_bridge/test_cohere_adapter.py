@@ -523,7 +523,12 @@ def _real_tokens(hf_model: Any, seq_len: int) -> torch.Tensor:
 # Not in the CI model cache (~0.5 GB download), so opt-in: pytest -m slow.
 @pytest.mark.slow
 class TestCohereRealCheckpointLogitParity:
-    """Command-R acceptance gate: bridge logits equal HF logits to 1e-4 max abs diff."""
+    """Command-R weight-conversion acceptance gate.
+
+    Smallest public checkpoint, float32, fixed input, max abs logit delta <= 1e-4,
+    plus intermediate activations. Runs through TransformerBridge: Cohere has no
+    HookedTransformer implementation.
+    """
 
     def test_checkpoint_is_not_degenerate(
         self, real_cohere_bridge: TransformerBridge, real_cohere_hf: Any
@@ -545,7 +550,44 @@ class TestCohereRealCheckpointLogitParity:
         # An absolute tolerance is vacuous if the logits themselves are that small.
         assert hf_scale > 100 * PARITY_TOL, f"HF logits too small to test parity: {hf_scale:.2e}"
         max_diff = (bridge_logits - hf_logits).abs().max().item()
-        assert max_diff < PARITY_TOL, (
+        assert max_diff <= PARITY_TOL, (
             f"{REAL_MODEL!r} bridge vs HF max abs diff = {max_diff:.2e} "
             f"(tolerance {PARITY_TOL:.0e}, HF logit scale {hf_scale:.2e}, seq_len={seq_len})"
         )
+
+    def test_intermediate_activations_match_hf(
+        self, real_cohere_bridge: TransformerBridge, real_cohere_hf: Any
+    ) -> None:
+        """Secondary check: layer-0 resid_pre, layer-0 attention pattern, final resid."""
+        tokens = _real_tokens(real_cohere_hf, 8)
+        layers = real_cohere_hf.model.layers
+        hf_acts: dict[str, torch.Tensor] = {}
+
+        def _capture_input(_module: Any, args: tuple, kwargs: dict) -> None:
+            hf_acts["resid_pre_0"] = (args[0] if args else kwargs["hidden_states"]).detach()
+
+        def _capture_output(_module: Any, _args: tuple, output: Any) -> None:
+            hf_acts["final_resid"] = (output[0] if isinstance(output, tuple) else output).detach()
+
+        handles = [
+            layers[0].register_forward_pre_hook(_capture_input, with_kwargs=True),
+            layers[-1].register_forward_hook(_capture_output),
+        ]
+        try:
+            with torch.no_grad():
+                hf_out = real_cohere_hf(tokens, output_attentions=True)
+                _, cache = real_cohere_bridge.run_with_cache(tokens)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        last = len(layers) - 1
+        pairs = {
+            "resid_pre layer 0": (cache["blocks.0.hook_resid_pre"], hf_acts["resid_pre_0"]),
+            "attn pattern layer 0": (cache["blocks.0.attn.hook_pattern"], hf_out.attentions[0]),
+            "final resid": (cache[f"blocks.{last}.hook_resid_post"], hf_acts["final_resid"]),
+        }
+        for name, (bridge_act, hf_act) in pairs.items():
+            assert bridge_act.shape == hf_act.shape, f"{name}: shape mismatch"
+            max_diff = (bridge_act - hf_act).abs().max().item()
+            assert max_diff <= PARITY_TOL, f"{name}: max abs diff = {max_diff:.2e}"

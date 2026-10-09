@@ -90,6 +90,19 @@ Not run as a consequence:
 
 ## 5. Upstream #1126 and #1127
 
+```{admonition} Correction, 2026-10-09
+:class: warning
+The numbers were probably meant differently from how this section reads them. Notification emails in the project mailbox, each headed `[TransformerLensOrg/TransformerLens]`, describe:
+
+- **#1124** — pull request "Add Command-R adapter": "Adds a Command-R weight-conversion table and acceptance test. Logits match to 1e-4 on the smallest checkpoint."
+- **#1126** — issue "bug: ActivationCache repr is very slow for large caches". Unrelated to Command-R or any adapter.
+- **#1127** — issue "question: roadmap for Command-R and DeepSeek adapters": "Are Command-R (#1124) and a DeepSeek adapter on the near-term roadmap?"
+
+Verified: those emails exist and say this. Also verified: on github.com, upstream #1126 and #1127 are the merged pull requests analysed below, with different titles and dates. The two sources disagree, and this repository has no issues or pull requests of its own. **Unresolved:** which tracker the emails refer to, and whether the #1124 claim of a 1e-4 match was ever backed by a saved log.
+
+Impact under the email reading: #1126 has no bearing on this release. #1127 is a roadmap question whose honest answer is in section 8: Command-R and DeepSeek V2 / V3 / R1 are implemented but unverified. #1124's claim is not supported by anything in this repository; the registry shows the only non-degenerate Cohere checkpoint failing parity. The analysis below is kept because it is accurate about upstream, but it should not be read as the impact of the issues above.
+```
+
 Both numbers refer to **merged pull requests** in `TransformerLensOrg/TransformerLens`, not issues. This repository (`mechlens-backup-main`) has no issues or pull requests with these numbers.
 
 ### Verified facts (from the upstream PR pages and diffs)
@@ -198,7 +211,7 @@ Status values: **PASS (static)** means confirmed by reading only. **FAIL** means
 
 ### E. Acceptance test audit
 
-**Requirement source.** [V] The repository contains no Command-R-specific acceptance document. The governing requirement is the general new-adapter rule: an integration parity test at `tests/integration/model_bridge/test_<arch>_adapter.py` asserting logit parity against Hugging Face at fp32 with eager attention (`AGENTS.md` §11, `supported_architectures/AGENTS.md` "Required tests"), with `< 1e-4` max absolute difference as the fp32 bar (`debugging_numerical_divergence.md`). `tests/acceptance/` holds no Cohere test and, by convention, is not where per-adapter parity lives.
+**Requirement source.** [V] The repository contains no Command-R-specific acceptance document (the project's written methodology was found later, outside the repository; see section 8). The governing requirement is the general new-adapter rule: an integration parity test at `tests/integration/model_bridge/test_<arch>_adapter.py` asserting logit parity against Hugging Face at fp32 with eager attention (`AGENTS.md` §11, `supported_architectures/AGENTS.md` "Required tests"), with `< 1e-4` max absolute difference as the fp32 bar (`debugging_numerical_divergence.md`). `tests/acceptance/` holds no Cohere test and, by convention, is not where per-adapter parity lives.
 
 | Test | Compares bridge vs HF logits at 1e-4 max abs? | Genuine? |
 |---|---|---|
@@ -232,7 +245,74 @@ Differences that remain against upstream, all unresolved until the two are actua
 - The partial-rotary path here applies the selected rotation to the rotated slice. How upstream handles that case is not visible in the diff.
 - One fixture detail changed for safety: the offline integration fixture no longer passes `attn_implementation="eager"` to `CohereConfig(...)` and relies on setting `_attn_implementation` after construction, the pattern `test_glm_moe_dsa_adapter.py` already uses.
 
-## 8. Recommendation
+## 8. Audit of remaining criteria (2026-10-09, branch at `1008f60` plus this commit)
+
+### Acceptance methodology found outside the repository
+
+[V] A project note in Drive, "Weight-conversion acceptance test methodology", states the rule this release is held to. It is not in the repository. Compared with the test on this branch:
+
+| Methodology requirement | `TestCohereRealCheckpointLogitParity` | Status |
+|---|---|---|
+| Smallest **public** checkpoint of the family | `hyper-accel/tiny-random-cohere` (ungated). `trl-internal-testing/tiny-CohereForCausalLM` is smaller but has `d_head = 2` and cannot detect a RoPE error. | Met, with a documented substitution |
+| Load in HF and in **HookedTransformer** | Loads HF and **TransformerBridge**. [V] No Cohere entry exists in `transformer_lens/supported_models.py` or `loading_from_pretrained.py`, so a HookedTransformer comparison is impossible in this codebase. | **Deviation**; needs a maintainer decision |
+| Fixed short prompt, float32 | Fixed token ids (BOS plus fixed in-vocabulary ids), float32, eager attention | Met; uses ids instead of text to avoid a tokenizer dependency |
+| Max absolute logit delta `<= 1e-4` | `max_diff <= 1e-4`, with a guard that HF logits exceed `1e-2` | Met as written |
+| Secondary: `resid_pre` layer 0, attention pattern layer 0, final resid | `test_intermediate_activations_match_hf`, added in this commit | Met as written |
+| Save the log; record pass/fail and the box in the adapter matrix and `Releases/demo_sweep_results.csv` | No log exists because the test has not run. `Releases/` does not exist in this repository. | **Not met** |
+| No adapter merges without the test | The Cohere adapter is already on `main` without a passing record | **Not met** (pre-existing) |
+
+**Execution: BLOCKED, not run.** `pytest ... -m slow` again stopped at `ModuleNotFoundError: No module named 'torch'`.
+
+### Actual CI result for `main`
+
+[V] GitHub Actions run 37984279901, workflow "Checks", commit `a4c3648` (`main`), finished 2026-10-09 20:09 UTC, conclusion **failure**. This is the baseline *before* any change on this branch.
+
+| Job | Result |
+|---|---|
+| Format Check | passed |
+| Type Check | **failed** (step "Type check") |
+| Compatibility Checks 3.10 / 3.11 / 3.12 | **failed** (step "Unit Test") |
+| Docstring Test | **failed** |
+| Full Code Coverage Test | **failed** |
+| Benchmark Tests | **failed** |
+| MPS Checks | **failed** (step "MPS Unit Tests") |
+| Notebook Checks | 2 passed (`LLaMA`, `LLaMA_GPU_Quantized`), 13 **failed** |
+| Build Docs, Deploy Docs | skipped |
+
+Unresolved: **why** they failed. The job logs could not be downloaded from the sandbox, and the annotations show only exit codes and a `git` exit-128 warning on every job. No CI run exists for this branch: the workflow triggers on pushes to `main` / `dev*` / `refactor*` and on pull requests, and no pull request has been opened. Opening one is the quickest way to get real test results for this branch, but with `main` already red its result will need comparing against this baseline.
+
+### Support status by family
+
+Three states, used consistently here, in `Adapters/adapter_support_matrix.xlsx`, and in `model_tables.md`:
+
+- **Implemented and verified** — adapter exists and a passing parity result is recorded for a non-degenerate checkpoint.
+- **Implemented, unverified** — adapter exists; no such result is recorded.
+- **Unsupported** — no adapter.
+
+| Family | State | Basis |
+|---|---|---|
+| Command-R, Command-R+, Aya (`CohereForCausalLM`) | Implemented, unverified | Section 7. One verified registry entry, on a degenerate `d_head = 2` model; the non-degenerate one failed. |
+| DeepSeek V2 (`DeepseekV2ForCausalLM`) | Implemented, unverified | 0 verified, 1 failed, 29 skipped. No unit adapter test. |
+| DeepSeek V3 (`DeepseekV3ForCausalLM`) | Implemented, unverified | 2 tiny random models verified with issues; 5 tiny models failed Phase 1; no full-size run. No unit adapter test. |
+| DeepSeek R1 | Implemented, unverified | Loads through the V3 adapter. 0 of 10 R1-named V3 entries verified. |
+| Command R7B, Command A (`Cohere2ForCausalLM`, `Cohere2MoeForCausalLM`) | Unsupported | Listed in `architecture_gaps.json`; no adapter here. |
+| DeepSeek V3.2, V4, original MoE, VL2 (`DeepseekV32…`, `DeepseekV4…`, `DeepseekForCausalLM`, `DeepseekVLV2…`) | Unsupported | Listed in `architecture_gaps.json`; no adapter here. |
+
+### Support matrix file
+
+[V] `Adapters/adapter_support_matrix.xlsx` did not exist in this repository or its history. A Google Sheet titled "Model-adapater support matrix.xlsx" exists in the project Drive with 13 families, all marked `supported`, and no Command-R or DeepSeek rows. The repository file was created in this commit from that sheet: its 13 rows and its `coverage` tab are copied unchanged, and six rows were added (Command-R; DeepSeek V2, V3, R1; and two unsupported groups) with a status key. The Drive sheet itself was not modified. The copied rows were **not** re-verified, and several do not obviously correspond to this codebase (for example the "since TL version" values and a LLaMA-4 row), so the header line "Every family ships a weight-conversion acceptance test" is unconfirmed for them. The `coverage` counts were left as they were; no family was added to the supported total.
+
+### Other criteria
+
+| Criterion | Evidence | Status |
+|---|---|---|
+| Changes committed and pushed | `git ls-remote` matches local `HEAD` after each commit | Met |
+| Runtime parity and regression tests pass | None executed | **Not met** |
+| Registry re-verified for Cohere | Entries predate the fix | **Not met** |
+| Sync with upstream `dev` (PR #1873, Cohere2) | Section 7F | **Not met** |
+| Maintainer notified | No maintainer email address is listed in this repository, in upstream `pyproject.toml`, or in the project mailbox or Drive. Named maintainers: Jonah Larson (primary, per `news/release-3.0.md`), Bryce Meyer (previous). | Open: recipient address needed |
+
+## 9. Recommendation
 
 **BLOCKED / NO-GO** for releasing Command-R support and for merging the shared attention bridge change into a release branch.
 
