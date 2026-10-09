@@ -160,7 +160,7 @@ Reconciled on 2026-10-09 by reading the adapters, the three registration sites, 
 
 Other verified discrepancies:
 
-- `ARCHITECTURE_DESCRIPTIONS` lacks entries for 24 of the 66 architectures in `HF_SUPPORTED_ARCHITECTURES`. The docs said a missing entry drops the architecture from the generated table; the code falls back to an auto-generated description instead. Docs corrected. Three entries were added (above); the other 21 are still missing.
+- `ARCHITECTURE_DESCRIPTIONS` lacked entries for 24 of the 66 architectures in `HF_SUPPORTED_ARCHITECTURES`. The docs said a missing entry drops the architecture from the generated table; the code falls back to an auto-generated description instead. Docs corrected. Three entries were added (above); the other 21 are still missing.
 - `tests/unit/model_bridge/supported_architectures/` has 57 adapter test files, not 26, and none for `deepseek_v2.py` or `deepseek_v3.py`, although the adapter guide calls a unit adapter test mandatory. Count corrected; the tests were not written.
 - `debugging_numerical_divergence.md` pointed at `cfg.scale_embeddings`, which does not exist anywhere under `transformer_lens/`. Corrected.
 - `NemotronHForCausalLM` has an adapter and is in `HF_SUPPORTED_ARCHITECTURES`, yet has no registry entries and is still listed in `architecture_gaps.json` as unsupported. Both data files are generated, so they were left alone; they need a fresh scrape.
@@ -394,11 +394,39 @@ No written list of 18 release-readiness criteria was found in this repository, t
 | 17 | Status email exists as a Gmail draft and is unsent | PASS | Draft `r1685509882029817192` carries only the DRAFT label; nothing with that subject in Sent |
 | 18 | Draft is addressed to a verified TransformerLens maintainer | FAIL | Addressed to `bram.giraffetasks@gmail.com`, chosen by the repository owner. No source lists this address as a maintainer; the named maintainers have no listed email |
 
-Totals: 10 PASS, 2 FAIL, 6 BLOCKED.
+Totals: 11 PASS, 2 FAIL, 5 BLOCKED. (An earlier revision of this line said 10 / 2 / 6, which did not match the table.)
 
 ## 11. Recommendation
 
 **BLOCKED / NO-GO** for releasing Command-R support and for merging the shared attention bridge change into a release branch.
+
+### Confirmed
+
+Each item was checked directly: by reading source, by command output, or from a recorded result. None is a test result for this branch.
+
+- The three defects in section 1 are present in the code on `main`, by comparison with the pinned `transformers` 5.8.1 source.
+- Upstream confirmed the RoPE defect at runtime and fixed it (PR #1873); this branch uses the same flag and helper. That evidence is about upstream's code.
+- The branch is pushed and matches its remote; it changes 19 files relative to `main`.
+- The changed Python files parse, and unpinned lint, format and type tools report nothing that is not already on `main`.
+- The registry records one verified Cohere entry (a `d_head = 2` model), one failed, and 17 skipped; all predate the fix.
+- CI on `main` failed on 2026-10-09 (Type Check, Unit Test on three Python versions, and others) for reasons not yet known.
+- The acceptance test exists and matches the written methodology except that it compares against TransformerBridge.
+- The support matrix, `model_tables.md` and the report descriptions agree with the adapter factory and `architecture_gaps.json`.
+
+### Not executed
+
+No test of any kind has run on this branch. The environment it was written in has no `torch` and cannot reach PyPI or the Hugging Face Hub.
+
+- Cohere unit tests and offline parity tests.
+- The real-checkpoint acceptance test (`make cohere-acceptance-test`).
+- Tests for the other adapters that share the attention bridge (`make test-pr`).
+- Format and type checks with the pinned tool versions.
+- `verify_models` on any Cohere checkpoint, gated or not.
+- Anything exercising QK-norm or the `logit_scale` fix at runtime, here or upstream.
+
+### Why this is a NO-GO
+
+The fixes are plausible and one of them is corroborated upstream, but nothing shows that this branch produces correct logits or leaves other adapters unchanged. The decision should be revisited only when the items under "Not executed" have real output.
 
 (exit-criteria)=
 ### Exit criteria
