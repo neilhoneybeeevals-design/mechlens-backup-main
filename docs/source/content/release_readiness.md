@@ -4,7 +4,7 @@ orphan: true
 
 # Release Readiness — Command-R (Cohere) Model Support
 
-**Status: BLOCKED / NO-GO.** Last updated 2026-10-09. The ordered list of checks, owners and pass criteria is in [section 9](#9-fastest-path-to-release-readiness). Branch `fix/cohere-rope-qknorm-logit-scale` (base `main` @ `a4c3648`). Code changes are in `1b7c4a9`, `68dbd36`, `1008f60` and `56ddd53`; the other commits are documentation.
+**Status: BLOCKED / NO-GO.** Last updated 2026-10-09. The ordered list of checks, owners and pass criteria is in [section 9](#fastest-path). Branch `fix/cohere-rope-qknorm-logit-scale` (base `main` @ `a4c3648`). Code changes are in `1b7c4a9`, `68dbd36`, `1008f60` and `56ddd53`; the other commits are documentation.
 
 The Command-R fixes below have **not been executed**. No test in this repository has been run against them. Do not release Command-R support, or anything depending on the shared attention bridge changes, until the [exit criteria](#exit-criteria) are met.
 
@@ -169,7 +169,7 @@ Left unchanged on purpose: `news/release-3.0.md` (a dated release essay), the re
 
 ## 7. Command-R release-verification matrix
 
-State of the repository at `78278ef` on 2026-10-09. Ordered by release priority: real-model logit parity first, then registry consistency, then compatibility with existing adapters.
+First compiled at `78278ef` on 2026-10-09. No status below has changed since, because no test has run; later commits added the real-checkpoint acceptance test (A4), pinned the HF reference to float32 for A6, and added `make cohere-acceptance-test`, which runs A4–A7 in one command. Ordered by release priority: real-model logit parity first, then registry consistency, then compatibility with existing adapters.
 
 **No row has a runtime PASS.** Evidence is tagged by kind, and the kinds must not be mixed:
 
@@ -320,8 +320,9 @@ Three states, used consistently here, in `Adapters/adapter_support_matrix.xlsx`,
 | Runtime parity and regression tests pass | None executed | **Not met** |
 | Registry re-verified for Cohere | Entries predate the fix | **Not met** |
 | Sync with upstream `dev` (PR #1873, Cohere2) | Section 7F | **Not met** |
-| Maintainer notified | No maintainer email address is listed in this repository, in upstream `pyproject.toml`, or in the project mailbox or Drive. Named maintainers: Jonah Larson (primary, per `news/release-3.0.md`), Bryce Meyer (previous). | Open: recipient address needed |
+| Maintainer notified | An unsent Gmail draft exists, addressed to `bram.giraffetasks@gmail.com` at the repository owner's choice. No source lists that address as a maintainer, and no maintainer email is listed in this repository, in upstream `pyproject.toml`, or in the project mailbox or Drive. Named maintainers: Jonah Larson (primary, per `news/release-3.0.md`), Bryce Meyer (previous). | **Not met**: nothing sent; recipient unverified |
 
+(fastest-path)=
 ## 9. Fastest path to release readiness
 
 ### Blocker, re-checked 2026-10-09 18:25 (UTC-5)
@@ -401,6 +402,8 @@ Totals: 10 PASS, 2 FAIL, 6 BLOCKED.
 
 (exit-criteria)=
 ### Exit criteria
+
+Section 9 gives the same gate as ordered steps with commands, owners and pass criteria; where the two differ, section 9 is current.
 
 All of the following must be produced as actual command output on a machine with `torch` installed:
 
