@@ -40,6 +40,16 @@ Registry evidence consistent with defect 1 (recorded before this branch, in `sup
 | `tests/unit/model_bridge/supported_architectures/test_cohere_adapter.py` | Rotation, QK-norm, and `logit_scale` unit tests |
 | `tests/integration/model_bridge/test_cohere_adapter.py` | Offline parity tests (`d_head = 8`, GQA, with and without QK-norm) |
 
+### Later code changes on the branch
+
+| Commit | Files | Change |
+|---|---|---|
+| `68dbd36`, `56ddd53` | `tests/integration/model_bridge/test_cohere_adapter.py` | Real-checkpoint acceptance test, then its `<= 1e-4` assertion and intermediate-activation checks |
+| `1008f60` | `transformer_lens/config/transformer_bridge_config.py`, `position_embeddings_attention.py`, `cohere.py`, both Cohere test files | RoPE switch moved to the `rotary_interleaved_cos_sin` config field, matching upstream PR #1873 |
+| `78278ef` | `transformer_lens/tools/model_registry/generate_report.py`, `architecture_adapter.py` (docstring) | Report descriptions for DeepSeek V2 / V3 and Gemma 3 multimodal; Cohere description narrowed |
+| `078c037` | `tests/integration/model_bridge/test_cohere_adapter.py` | HF reference fixture pinned to float32 + eager |
+| `a0cc546` | `makefile` | `make cohere-acceptance-test` |
+
 ## 2. Checks that ran
 
 Run on 2026-10-09 in a sandbox with no access to PyPI or the Hugging Face Hub. `torch` and `transformers` were not installed. The tools came from a local cache and are **not the versions this repo pins**, so these results are indicative only.
@@ -215,7 +225,7 @@ Status values: **PASS (static)** means confirmed by reading only. **FAIL** means
 
 | Test | Compares bridge vs HF logits at 1e-4 max abs? | Genuine? |
 |---|---|---|
-| `TestCohereForwardEquivalence::test_forward_matches_hf` (on `main`) | Yes, formally: `max_diff < 1e-4` against an independently loaded HF model. | **No.** [V] The model has `d_head = 2`, so a wrong RoPE convention cannot change its logits. The fixtures do not pin fp32 and eager on the HF side. There is no check that the logits are larger than the tolerance; upstream measured `2.2e-09` on this model with the defect present. |
+| `TestCohereForwardEquivalence::test_forward_matches_hf` (on `main`) | Yes, formally: `max_diff < 1e-4` against an independently loaded HF model. | **No.** [V] The model has `d_head = 2`, so a wrong RoPE convention cannot change its logits. On `main` the HF reference fixture was unpinned and loaded in float16 (the checkpoint's declared dtype) against a float32 bridge; `078c037` pins it to float32 + eager. There is no check that the logits are larger than the tolerance; upstream measured `2.2e-09` on this model with the defect present. |
 | `TestCohereOfflineParity::test_forward_matches_hf` (added in `1b7c4a9`) | Yes: `max_diff < 1e-4`, with a guard that HF logits exceed `1e-2`. | Partly. Sensitive to RoPE, GQA and QK-norm, but on random synthetic weights, not a checkpoint. |
 | `TestCohereRealCheckpointLogitParity::test_logits_match_hf_within_tolerance` (added with this audit) | Yes: `max_diff < 1e-4` at fp32 + eager on `hyper-accel/tiny-random-cohere`, at two sequence lengths, with a guard that HF logits exceed `100 ×` the tolerance. | Intended as the acceptance gate. Real ungated checkpoint with `d_head = 128`. Marked `slow` because the model is outside the CI cache (per `tests/AGENTS.md`), so `make integration-test` does **not** run it; it must be invoked with `-m slow`. |
 
@@ -330,9 +340,11 @@ The sandbox this work was done in **cannot run any Command-R test**, unit or off
 
 No code was changed in response. Nothing below has been run.
 
-**To unblock, any one of:** allow `pypi.org` and `files.pythonhosted.org` for the session (add `huggingface.co` for steps 4, 5, 8 and 9); run the steps on a developer machine; or open a pull request from the branch so GitHub Actions runs steps 2, 3, 5, 6 and 7 (it will not run step 4, which is marked `slow`).
+**To unblock, any one of:** allow `pypi.org` and `files.pythonhosted.org` for the session (add `huggingface.co` for steps 4, 5, 8 and 9); run the steps on a developer machine; or open a pull request from the branch so GitHub Actions runs steps 2, 3, 5, 6 and 7 (it will not run step 4, which is marked `slow`; use `make cohere-acceptance-test` for that).
 
 ### Ordered checks
+
+**Shortcut for steps 2–5:** `make cohere-acceptance-test` runs both Cohere test files in full — unit, offline parity, Hub tiny model and the real-checkpoint acceptance test — including `slow` tests and with no automatic reruns. It needs `torch` and Hugging Face access. Pass criterion: 0 failed, 0 errors; keep the output as the acceptance log. [V] `make -n cohere-acceptance-test` resolves to the intended `pytest` command; running it here fails at dependency install (403 from `files.pythonhosted.org`).
 
 Run top to bottom and stop at the first failure. Steps 1–3 need no Hugging Face access and take minutes; they are the fastest real signal. Owners are roles: no one has been assigned or has accepted any of these, and the names in brackets are proposals.
 
