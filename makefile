@@ -62,6 +62,11 @@ notebook-test:
 	$(RUN) pytest --nbval-sanitize-with demos/doc_sanitize.cfg demos/Attribution_Patching_Demo.ipynb $(RERUN_ARGS)
 	$(RUN) pytest --nbval-sanitize-with demos/doc_sanitize.cfg demos/Grokking_Demo.ipynb $(RERUN_ARGS)
 
+# Command-R release gate: unit, offline parity and the real-checkpoint acceptance test.
+# Runs slow tests too and uses no reruns, so a flaky pass cannot hide a parity failure.
+cohere-acceptance-test:
+	$(RUN) pytest tests/unit/model_bridge/supported_architectures/test_cohere_adapter.py tests/integration/model_bridge/test_cohere_adapter.py -v
+
 test-pr:
 	$(MAKE) unit-test
 	$(MAKE) docstring-test
