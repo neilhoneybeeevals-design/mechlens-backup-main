@@ -26,6 +26,13 @@ All three defects have the same cause: the Cohere adapter was written as if `Pos
 
 Registry evidence consistent with defect 1 (recorded before this branch, in `supported_models.json`): `trl-internal-testing/tiny-CohereForCausalLM` (`d_head = 2`) is the only verified Cohere entry; `hyper-accel/tiny-random-cohere` (`d_head = 128`) is `FAILED` with `P1=50.0% (failed: forward_pass_logits)`.
 
+Evidence on defect 3 (investigated 2026-10-09; nothing executed):
+
+- **Code path, verified by reading.** `TransformerBridge.forward` has one route to logits, `self.original_model(...)`. `GeneralizedComponent.set_processed_weights` replaces `lm_head.weight` with the processed tensor, so after the fold the HF forward computes `lm_head_scaled(x) * self.logit_scale`. No other code reads or compensates for `logit_scale`.
+- **Registry, historical.** `hyper-accel/tiny-random-cohere` failed a *required* Phase 3 test. Phase 3 compares the processed bridge with the same bridge's own unprocessed logits, so that failure is independent of the RoPE defect and shows weight processing changing the output on a non-degenerate Cohere model. It is consistent with a double-applied scale but does not isolate it: other processing steps could also contribute.
+- **Why the degenerate model passed.** Phase 3 compares `log_softmax` with an absolute tolerance of 0.01. On `trl-internal-testing/tiny-CohereForCausalLM` the logits are far smaller than that, so a scale error cannot show.
+- **Still uncertain.** Whether the fix yields exact parity has not been observed. `TestCohereOfflineProcessedLogitScale` decides it without Hub access: `test_scale_lives_in_exactly_one_place` checks the wiring without a forward pass, and `test_processed_forward_matches_hf` checks the logits.
+
 ### Files changed in `1b7c4a9` (9 files, +453 / −61)
 
 | File | Change |

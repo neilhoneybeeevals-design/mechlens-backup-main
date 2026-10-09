@@ -481,15 +481,41 @@ class TestCohereOfflineParity:
 class TestCohereOfflineProcessedLogitScale:
     """logit_scale must be applied exactly once after process_weights."""
 
+    _FOLD_ONLY = dict(
+        fold_ln=False,
+        center_writing_weights=False,
+        center_unembed=False,
+        fold_value_biases=False,
+        refactor_factored_attn_matrices=False,
+    )
+
+    def test_scale_lives_in_exactly_one_place(self) -> None:
+        """Forward-free check of the wiring: weights x runtime multiply == logit_scale.
+
+        The bridge forward runs CohereForCausalLM.forward, so the effective scale
+        is (lm_head weight ratio) * hf_model.logit_scale, before and after.
+        """
+        bridge, hf_reference = _offline_cohere(use_qk_norm=False)
+        scale = hf_reference.config.logit_scale
+        hf_weight = hf_reference.lm_head.weight.detach()
+
+        # Unprocessed: raw weights, HF multiplies at runtime.
+        assert bridge.original_model.logit_scale == scale
+        assert torch.allclose(bridge.unembed.original_component.weight, hf_weight, atol=1e-6)
+
+        bridge.process_weights(**self._FOLD_ONLY)
+
+        # Processed: scale folded into the weights, runtime multiply switched off.
+        folded = bridge.unembed.original_component.weight
+        assert torch.allclose(folded, hf_weight * scale, atol=1e-6)
+        assert bridge.original_model.logit_scale == 1.0, (
+            "logit_scale was folded into unembed.weight but HF's runtime multiply is "
+            "still active: processed logits would be scaled twice"
+        )
+
     def test_processed_forward_matches_hf(self) -> None:
         bridge, hf_reference = _offline_cohere(use_qk_norm=False)
-        bridge.process_weights(
-            fold_ln=False,
-            center_writing_weights=False,
-            center_unembed=False,
-            fold_value_biases=False,
-            refactor_factored_attn_matrices=False,
-        )
+        bridge.process_weights(**self._FOLD_ONLY)
         with torch.no_grad():
             bridge_out = bridge(OFFLINE_TOKENS)
             hf_out = hf_reference(OFFLINE_TOKENS).logits
