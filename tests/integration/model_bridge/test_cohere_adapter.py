@@ -486,3 +486,64 @@ class TestCohereOfflineProcessedLogitScale:
             hf_out = hf_reference(OFFLINE_TOKENS).logits
         max_diff = (bridge_out - hf_out).abs().max().item()
         assert max_diff < 1e-4, f"Processed bridge vs HF max diff = {max_diff:.6f}"
+
+
+# ---------------------------------------------------------------------------
+# 8. Acceptance: real-checkpoint logit parity vs Hugging Face (max abs diff < 1e-4)
+# ---------------------------------------------------------------------------
+
+# Ungated real checkpoint with d_head=128 and logit_scale=0.0625. Unlike MODEL above
+# (d_head=2), its logits depend on the RoPE convention, so parity here is meaningful.
+REAL_MODEL = "hyper-accel/tiny-random-cohere"
+PARITY_TOL = 1e-4
+
+
+@pytest.fixture(scope="module")
+def real_cohere_bridge() -> TransformerBridge:
+    return TransformerBridge.boot_transformers(REAL_MODEL, device="cpu", dtype=torch.float32)
+
+
+@pytest.fixture(scope="module")
+def real_cohere_hf() -> Any:
+    """HF reference loaded independently of the bridge's wrapped instance."""
+    return AutoModelForCausalLM.from_pretrained(
+        REAL_MODEL, torch_dtype=torch.float32, attn_implementation="eager"
+    ).eval()
+
+
+def _real_tokens(hf_model: Any, seq_len: int) -> torch.Tensor:
+    """BOS followed by fixed, spread-out in-vocab ids (no tokenizer dependence)."""
+    bos = hf_model.config.bos_token_id
+    ids = [bos] + [(1000 + 977 * i) % hf_model.config.vocab_size for i in range(seq_len - 1)]
+    return torch.tensor([ids])
+
+
+# Not in the CI model cache (~0.5 GB download), so opt-in: pytest -m slow.
+@pytest.mark.slow
+class TestCohereRealCheckpointLogitParity:
+    """Command-R acceptance gate: bridge logits equal HF logits to 1e-4 max abs diff."""
+
+    def test_checkpoint_is_not_degenerate(
+        self, real_cohere_bridge: TransformerBridge, real_cohere_hf: Any
+    ) -> None:
+        # d_head == 2 would make the RoPE conventions indistinguishable.
+        assert real_cohere_bridge.cfg.d_head > 2
+        assert getattr(real_cohere_bridge.cfg, "logit_scale") == real_cohere_hf.config.logit_scale
+
+    @pytest.mark.parametrize("seq_len", [4, 32])
+    def test_logits_match_hf_within_tolerance(
+        self, real_cohere_bridge: TransformerBridge, real_cohere_hf: Any, seq_len: int
+    ) -> None:
+        tokens = _real_tokens(real_cohere_hf, seq_len)
+        with torch.no_grad():
+            bridge_logits = real_cohere_bridge(tokens)
+            hf_logits = real_cohere_hf(tokens).logits
+        assert bridge_logits.shape == hf_logits.shape
+        hf_scale = hf_logits.abs().max().item()
+        # An absolute tolerance is vacuous if the logits themselves are that small.
+        assert hf_scale > 100 * PARITY_TOL, f"HF logits too small to test parity: {hf_scale:.2e}"
+        max_diff = (bridge_logits - hf_logits).abs().max().item()
+        assert max_diff < PARITY_TOL, (
+            f"{REAL_MODEL!r} bridge vs HF max abs diff = {max_diff:.2e} "
+            f"(tolerance {PARITY_TOL:.0e}, HF logit scale {hf_scale:.2e}, seq_len={seq_len})"
+        )
