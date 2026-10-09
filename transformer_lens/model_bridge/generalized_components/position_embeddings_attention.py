@@ -101,6 +101,30 @@ def _setup_eager_attention_hook_wrapper() -> None:
     _EAGER_ATTENTION_WRAPPED = True
 
 
+def _apply_rotary_pos_emb_interleaved_cos_sin(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Adjacent-pair RoPE for cos/sin that are already interleaved (Cohere).
+
+    CohereRotaryEmbedding emits each frequency twice (``repeat_interleave``) and
+    HF's Cohere ``rotate_half`` pairs elements ``2i`` / ``2i + 1``. cos/sin are
+    used as given; Llama's half-split rotation on the same inputs diverges from
+    HF once ``d_head > 2``. Computed in fp32 and cast back, as HF does.
+    """
+    original_dtype = q.dtype
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+
+    def _rotate(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
+        return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+    q_embed = (q.float() * cos) + (_rotate(q).float() * sin)
+    k_embed = (k.float() * cos) + (_rotate(k).float() * sin)
+    return q_embed.to(original_dtype), k_embed.to(original_dtype)
+
+
 class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBridge):
     """Attention bridge for models that require position embeddings (e.g., Gemma-3).
 
@@ -123,17 +147,8 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
         requires_attention_mask: bool = True,
         requires_position_embeddings: bool = True,
         is_causal: bool = True,
-        rotary_interleaved: bool = False,
         **kwargs,  # absorb any other AttentionBridge kwargs callers may pass
     ):
-        """Initialize the bridge.
-
-        Args:
-            rotary_interleaved: RoPE pairing convention. False (default) rotates
-                dim ``i`` with ``i + d/2`` (Llama). True rotates adjacent dims
-                ``2i`` / ``2i + 1`` (Cohere), matching rotary modules that build
-                cos/sin with ``repeat_interleave``.
-        """
         super().__init__(
             name,
             config,
@@ -153,7 +168,6 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
         if submodules is not None and "k_norm" in submodules:
             self.hook_k_normed = HookPoint()
         self._qk_norm_phase: Optional[str] = None
-        self._rotary_interleaved = rotary_interleaved
 
     def set_original_component(self, component: torch.nn.Module) -> None:
         """Wire HF module, register for rotary hooks, validate adapter declarations."""
@@ -245,32 +259,6 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
             normed = hook(norm_module(flat))
             return normed.view(b, s, h, d)
         return hook(norm_module(tensor))
-
-    def _apply_rotary(
-        self,
-        query_states: torch.Tensor,
-        key_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rotate Q/K ([B, H, S, D]) using the architecture's RoPE pairing convention."""
-        if not self._rotary_interleaved:
-            from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
-
-            return apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        # Mirrors HF Cohere's apply_rotary_pos_emb, including its fp32 upcast.
-        def rotate_adjacent(x: torch.Tensor) -> torch.Tensor:
-            return torch.stack([-x[..., 1::2], x[..., ::2]], dim=-1).flatten(-2)
-
-        dtype = query_states.dtype
-        q = query_states.float()
-        k = key_states.float()
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        q_embed = (q * cos) + (rotate_adjacent(q) * sin)
-        k_embed = (k * cos) + (rotate_adjacent(k) * sin)
-        return q_embed.to(dtype=dtype), k_embed.to(dtype=dtype)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Reimplemented forward pass with hooks at correct computation stages.
@@ -428,6 +416,12 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
         if position_embeddings is not None:
             position_embeddings = self._apply_position_embedding_hooks(position_embeddings)
             cos, sin = position_embeddings
+            from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+            rotate: Callable[..., tuple[torch.Tensor, torch.Tensor]] = apply_rotary_pos_emb
+            if getattr(self.config, "rotary_interleaved_cos_sin", False):
+                # Cohere: adjacent-pair rotation with cos/sin already interleaved.
+                rotate = _apply_rotary_pos_emb_interleaved_cos_sin
 
             # Some models use partial rotary (e.g., GPT-OSS) where cos/sin cover only
             # a portion of head_dim. Split Q/K, rotate the partial dims, recombine.
@@ -435,11 +429,11 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
             if rotary_dim < head_dim:
                 q_rot, q_pass = query_states[..., :rotary_dim], query_states[..., rotary_dim:]
                 k_rot, k_pass = key_states[..., :rotary_dim], key_states[..., rotary_dim:]
-                q_rot, k_rot = self._apply_rotary(q_rot, k_rot, cos, sin)
+                q_rot, k_rot = rotate(q_rot, k_rot, cos, sin)
                 query_states = torch.cat([q_rot, q_pass], dim=-1)
                 key_states = torch.cat([k_rot, k_pass], dim=-1)
             else:
-                query_states, key_states = self._apply_rotary(query_states, key_states, cos, sin)
+                query_states, key_states = rotate(query_states, key_states, cos, sin)
 
         # Fire hook_rot_q/hook_rot_k (post-rotation)
         if hasattr(self, "hook_rot_q"):

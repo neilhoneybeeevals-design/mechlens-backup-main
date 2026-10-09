@@ -1,9 +1,11 @@
 """Unit tests for CohereArchitectureAdapter: cfg, components, weight conversions, preprocess."""
 
+import copy
 from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import CohereConfig, CohereForCausalLM
 from transformers.models.cohere.modeling_cohere import (
     apply_rotary_pos_emb as cohere_apply_rotary_pos_emb,
 )
@@ -22,6 +24,12 @@ from transformer_lens.model_bridge.generalized_components import (
     PositionEmbeddingsAttentionBridge,
     RotaryEmbeddingBridge,
     UnembeddingBridge,
+)
+from transformer_lens.model_bridge.generalized_components.position_embeddings_attention import (
+    _apply_rotary_pos_emb_interleaved_cos_sin,
+)
+from transformer_lens.model_bridge.sources._bridge_builder import (
+    build_bridge_from_module,
 )
 from transformer_lens.model_bridge.supported_architectures.cohere import (
     CohereArchitectureAdapter,
@@ -81,6 +89,14 @@ class TestCohereAdapterConfig:
 
     def test_default_prepend_bos_is_true(self, adapter: CohereArchitectureAdapter) -> None:
         assert adapter.cfg.default_prepend_bos is True
+
+    def test_rotary_interleaved_cos_sin(self, adapter: CohereArchitectureAdapter) -> None:
+        # Selects Cohere's adjacent-pair rotation in the attention bridge.
+        assert adapter.cfg.rotary_interleaved_cos_sin is True
+
+    def test_rotary_interleaved_cos_sin_defaults_to_false(self) -> None:
+        # Fresh cfg: the class-scoped fixture's cfg is mutated by the adapter.
+        assert _make_cfg().rotary_interleaved_cos_sin is False
 
     def test_rotary_base_extracted(self) -> None:
         cfg = _make_cfg(rope_parameters={"rope_theta": 80000.0, "rope_type": "default"})
@@ -426,6 +442,45 @@ class TestCoherePreprocessWeights:
         assert sd["unembed.weight"].dtype == torch.float16
 
 
+class TestCohereParity:
+    """Bridge logits match HF on a tiny random model where the RoPE convention matters.
+
+    Synthetic and offline (no Hub), so it runs in the unit tier. d_head=8: at
+    d_head=2 the Cohere and Llama rotations coincide and nothing is tested.
+    """
+
+    def test_logits_match_hf(self) -> None:
+        torch.manual_seed(0)
+        hf_config = CohereConfig(
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            intermediate_size=64,
+            vocab_size=64,
+            max_position_embeddings=64,
+            tie_word_embeddings=False,
+        )
+        hf_model = CohereForCausalLM(hf_config).eval()
+        # Default init gives near-uniform attention, which hides rotation errors.
+        with torch.no_grad():
+            for param in hf_model.parameters():
+                param.add_(0.3 * torch.randn_like(param))
+        reference = copy.deepcopy(hf_model)
+        tokens = torch.randint(3, 60, (2, 10))
+
+        bridge = build_bridge_from_module(
+            hf_model, architecture="CohereForCausalLM", hf_config=hf_config
+        )
+        with torch.no_grad():
+            bridge_logits = bridge(tokens, return_type="logits")
+            hf_logits = reference(tokens).logits
+
+        assert hf_logits.abs().max().item() > 1e-2
+        max_diff = (bridge_logits - hf_logits).abs().max().item()
+        assert max_diff < 1e-4, f"Bridge vs HF max abs diff = {max_diff:.2e}"
+
+
 class TestCohereLogitScaleRuntimeNeutralized:
     """After the fold, HF's runtime logit_scale multiply must be switched off."""
 
@@ -484,30 +539,23 @@ class TestCohereRotaryConvention:
         angles = torch.repeat_interleave(torch.rand(1, 6, d_head // 2) * 3.0, 2, dim=-1)
         return q, k, angles.cos(), angles.sin()
 
-    def _attn(self, adapter: CohereArchitectureAdapter) -> PositionEmbeddingsAttentionBridge:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert isinstance(attn, PositionEmbeddingsAttentionBridge)
-        return attn
-
-    def test_matches_hf_cohere_rotation(self, adapter: CohereArchitectureAdapter) -> None:
+    def test_matches_hf_cohere_rotation(self) -> None:
         q, k, cos, sin = self._inputs(d_head=8)
-        q_rot, k_rot = self._attn(adapter)._apply_rotary(q, k, cos, sin)
+        q_rot, k_rot = _apply_rotary_pos_emb_interleaved_cos_sin(q, k, cos, sin)
         hf_q, hf_k = cohere_apply_rotary_pos_emb(q, k, cos, sin)
         assert torch.allclose(q_rot, hf_q, atol=1e-6)
         assert torch.allclose(k_rot, hf_k, atol=1e-6)
 
-    def test_differs_from_llama_rotation_when_d_head_above_two(
-        self, adapter: CohereArchitectureAdapter
-    ) -> None:
+    def test_differs_from_llama_rotation_when_d_head_above_two(self) -> None:
         q, k, cos, sin = self._inputs(d_head=8)
-        q_rot, _ = self._attn(adapter)._apply_rotary(q, k, cos, sin)
+        q_rot, _ = _apply_rotary_pos_emb_interleaved_cos_sin(q, k, cos, sin)
         llama_q, _ = llama_apply_rotary_pos_emb(q, k, cos, sin)
         assert (q_rot - llama_q).abs().max().item() > 1e-2
 
-    def test_conventions_coincide_at_d_head_two(self, adapter: CohereArchitectureAdapter) -> None:
+    def test_conventions_coincide_at_d_head_two(self) -> None:
         # Why a d_head=2 test model cannot catch a wrong convention.
         q, k, cos, sin = self._inputs(d_head=2)
-        q_rot, _ = self._attn(adapter)._apply_rotary(q, k, cos, sin)
+        q_rot, _ = _apply_rotary_pos_emb_interleaved_cos_sin(q, k, cos, sin)
         llama_q, _ = llama_apply_rotary_pos_emb(q, k, cos, sin)
         assert torch.allclose(q_rot, llama_q, atol=1e-6)
 

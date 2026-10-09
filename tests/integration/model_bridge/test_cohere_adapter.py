@@ -379,7 +379,6 @@ def _offline_cohere(use_qk_norm: bool) -> tuple[TransformerBridge, Any]:
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
-        attn_implementation="eager",
     )
     hf_reference = CohereForCausalLM(cfg).eval()
     with torch.no_grad():
@@ -419,6 +418,8 @@ class TestCohereOfflineParity:
         bridge, hf_reference = offline_cohere
         # d_head must exceed 2 or the two RoPE conventions are indistinguishable.
         assert bridge.cfg.d_head == 8
+        assert bridge.cfg.rotary_interleaved_cos_sin is True
+        assert all(block.attn.config.rotary_interleaved_cos_sin for block in bridge.blocks)
         assert bridge.cfg.n_key_value_heads == 2
         assert bridge.cfg.use_qk_norm == hf_reference.config.use_qk_norm
 
@@ -460,8 +461,9 @@ class TestCohereOfflineParity:
         defect; if this stops diverging, the parity tests above have gone blind.
         """
         bridge, hf_reference = _offline_cohere(use_qk_norm=False)
+        # Each block's attention reads its own config copy.
         for block in bridge.blocks:
-            block.attn._rotary_interleaved = False
+            block.attn.config.rotary_interleaved_cos_sin = False
         with torch.no_grad():
             bridge_out = bridge(OFFLINE_TOKENS)
             hf_out = hf_reference(OFFLINE_TOKENS).logits

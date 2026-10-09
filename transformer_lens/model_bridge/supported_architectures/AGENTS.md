@@ -239,7 +239,7 @@ Failure message names the missing set. (`INTENTIONAL_EXCLUDES` in the test handl
 | HF convention | Handled in | How |
 |---|---|---|
 | RoPE (rotary positional embeddings) | `llama.py`, `mistral.py`, `qwen2.py`+ | `RotaryEmbeddingBridge(name="model.rotary_emb")` + `cfg.positional_embedding_type = "rotary"` |
-| RoPE pairing adjacent dims (`repeat_interleave` cos/sin, `x[..., ::2]` rotate) | `cohere.py` | `PositionEmbeddingsAttentionBridge(..., rotary_interleaved=True)`. The default is Llama's half-split rotation; the two agree only when `d_head == 2` |
+| RoPE pairing adjacent dims (`repeat_interleave` cos/sin, `x[..., ::2]` rotate) | `cohere.py` | `self.cfg.rotary_interleaved_cos_sin = True` (read by `PositionEmbeddingsAttentionBridge`). The default is Llama's half-split rotation; the two agree only when `d_head == 2` |
 | Per-head QK LayerNorm (weight `[n_heads, d_head]`) | `cohere.py` (`use_qk_norm`, Command-R+) | Declare `q_norm` / `k_norm` submodules; the bridge applies them on `[B, S, H, D]` before the transpose |
 | GQA / MQA (`n_key_value_heads < n_heads`) | `llama.py`, `mistral.py`, `falcon.py`, `cohere.py` | Set `cfg.n_key_value_heads`; pass `n_kv_heads=` to `_qkvo_weight_conversions()` |
 | RMSNorm with offset | `gemma1.py`, `gemma2.py`, `gemma3.py` | `cfg.rmsnorm_uses_offset = True` + `ArithmeticTensorConversion(ADDITION, 1.0)` |

@@ -20,7 +20,7 @@ All three defects have the same cause: the Cohere adapter was written as if `Pos
 
 | # | Defect | Fix |
 |---|---|---|
-| 1 | The bridge always applied Llama's half-split RoPE rotation. HF Cohere rotates adjacent pairs. The two agree only when `d_head == 2`. | `rotary_interleaved` flag on the attention bridge; the Cohere adapter sets it. Default behaviour for other architectures is unchanged. |
+| 1 | The bridge always applied Llama's half-split RoPE rotation. HF Cohere rotates adjacent pairs. The two agree only when `d_head == 2`. | `rotary_interleaved_cos_sin` config flag (default `False`) read by the attention bridge; the Cohere adapter sets it. Same design and helper as upstream PR #1873 (see section 7E). Default behaviour for other architectures is unchanged. |
 | 2 | Checkpoints with `use_qk_norm=True` (Command-R+) have `q_norm` / `k_norm` that the adapter never declared, so the bridge raises at boot. The existing phase logic would also have applied a `[n_heads, d_head]` norm weight after the head/seq transpose. | Adapter declares both norms when `use_qk_norm` is set; new `per_head` phase applies them on `[B, S, H, D]`. |
 | 3 | `process_weights` folds `logit_scale` into `unembed.weight`, but the bridge forward still runs `CohereForCausalLM.forward`, which multiplies by `logit_scale` again. | New `ArchitectureAdapter.finalize_weight_processing` hook, called at the end of `TransformerBridge.process_weights`; Cohere resets `hf_model.logit_scale` to `1.0` once the fold is written. |
 
@@ -31,7 +31,7 @@ Registry evidence consistent with defect 1 (recorded before this branch, in `sup
 | File | Change |
 |---|---|
 | `transformer_lens/model_bridge/supported_architectures/cohere.py` | Interleaved RoPE, QK-norm submodules, single-application `logit_scale` |
-| `transformer_lens/model_bridge/generalized_components/position_embeddings_attention.py` | `rotary_interleaved`, `_apply_rotary`, `per_head` QK-norm phase |
+| `transformer_lens/model_bridge/generalized_components/position_embeddings_attention.py` | `_apply_rotary_pos_emb_interleaved_cos_sin` helper and its dispatch, `per_head` QK-norm phase |
 | `transformer_lens/model_bridge/architecture_adapter.py` | `finalize_weight_processing` no-op base hook |
 | `transformer_lens/model_bridge/bridge.py` | Calls the hook at the end of `process_weights` |
 | `transformer_lens/model_bridge/sources/transformers.py` | Maps HF `use_qk_norm` onto the declared config field |
@@ -83,7 +83,7 @@ Not run as a consequence:
 
 **Shared adapter regressions**
 
-- `position_embeddings_attention.py` is used by many architectures. The view/transpose block was restructured and RoPE now goes through `_apply_rotary`. By reading, the default path is equivalent; this is not confirmed by any test.
+- `position_embeddings_attention.py` is used by many architectures. The view/transpose block was restructured and RoPE is now selected through the `rotary_interleaved_cos_sin` config flag. By reading, the default path is equivalent; this is not confirmed by any test.
 - A `[n_heads, d_head]` QK-norm weight now selects `per_head` instead of `post_reshape`. Unresolved whether any other adapter, in-tree or out-of-tree, wraps a norm with a 2-D weight; this was not checked exhaustively.
 - `TransformerBridge.process_weights` now calls `finalize_weight_processing` for every adapter. The base implementation is a no-op.
 - `get_random_inputs` in the attention bridge falls back to an identity rotation (`cos = 1`, `sin = 0`) when the rotary module is unset or raises. Verified in source. Component-level benchmarks on that path cannot detect a RoPE convention error; only full-model parity can.
@@ -183,7 +183,7 @@ Status values: **PASS (static)** means confirmed by reading only. **FAIL** means
 
 | ID | Required check | Files / command | Evidence | Status | Release impact | Next action |
 |---|---|---|---|---|---|---|
-| C1 | Default attention path unchanged for the other adapters on the shared bridge | `transformer_lens/model_bridge/generalized_components/position_embeddings_attention.py`; 28 adapter files reference it (27 besides `cohere.py`) | [V] `rotary_interleaved` defaults to `False` and that branch calls the same Llama function as before; the view/transpose restructuring reads as equivalent. A second static review agreed. [U] No adapter test has run. | **NOT RUN** | **Release blocker.** This is the widest blast radius on the branch: Llama, Mistral-family, Gemma 1–3, Qwen 2–3, Phi, OLMo and others. | `make test-pr`. |
+| C1 | Default attention path unchanged for the other adapters on the shared bridge | `transformer_lens/model_bridge/generalized_components/position_embeddings_attention.py`; 28 adapter files reference it (27 besides `cohere.py`) | [V] `rotary_interleaved_cos_sin` defaults to `False` and that branch calls the same Llama function as before; the view/transpose restructuring reads as equivalent. A second static review agreed. [U] No adapter test has run. | **NOT RUN** | **Release blocker.** This is the widest blast radius on the branch: Llama, Mistral-family, Gemma 1–3, Qwen 2–3, Phi, OLMo and others. | `make test-pr`. |
 | C2 | QK-norm phase selection unchanged for adapters that already declare `q_norm` on this bridge | Same file (`_decide_qk_norm_phase`); `apertus.py`, `gemma3.py`, `gemma3_multimodal.py`, `glm4_moe.py`, `hunyuan_v1_dense.py`, `olmo2.py`, `olmoe.py`, `qwen3.py`, `qwen3_moe.py` under `transformer_lens/model_bridge/supported_architectures/` | [V] Only a 2-D `[n_heads, d_head]` weight now selects the new `per_head` phase; 1-D weights take the same branches as before. Unresolved: the actual weight shapes for these nine adapters were not inspected at runtime. | **NOT RUN** | Blocker if any of the nine has a 2-D norm weight; otherwise none. | Run their unit and integration tests; they are in `make test-pr`. |
 | C3 | New `finalize_weight_processing` hook is inert for every other adapter | `transformer_lens/model_bridge/architecture_adapter.py`, `transformer_lens/model_bridge/bridge.py` (end of `process_weights`) | [V] Base method is a no-op; `cohere.py` is the only override (grep). The call is guarded with `hasattr`. | **PASS (static)**; runtime NOT RUN | Low, but `process_weights` runs for every model in compatibility mode. | Covered by `make test-pr` (14 test files reference `process_weights`). |
 | C4 | Component benchmark change does not alter other architectures | `transformer_lens/benchmarks/component_outputs.py` | [V] The new branch triggers only when a `q_norm` / `k_norm` weight is 2-D. | **PASS (static)**; runtime NOT RUN | Low. Affects `verify_models` Phase 1 component scores, not library behaviour. | Observed as part of A4 and D2. |
@@ -210,9 +210,27 @@ Status values: **PASS (static)** means confirmed by reading only. **FAIL** means
 
 **Upstream has already fixed the RoPE defect.** [V, from the PR page only; its diff was not read] `TransformerLensOrg/TransformerLens` PR #1873, "fix(bridge): rotate Cohere and Cohere2 with their own RoPE convention", was merged into `dev` on 2026-10-09. Its author reports, for `hyper-accel/tiny-random-cohere` at fp32 on CPU, a bridge-versus-HF max difference of `1.07e-02` before and `7.8e-08` after. That is independent runtime confirmation of defect 1 and of this checkpoint as a discriminating gate. It is evidence about upstream code, not about this branch. Consequences:
 
-- This branch duplicates that fix with a different design (a `rotary_interleaved` constructor argument here; a `rotary_interleaved_cos_sin` config flag upstream). Unresolved which should be kept; taking the upstream change is the lower-risk default because it has run.
+- **Resolved after comparing against the PR diff (below).** This branch originally duplicated that fix with a different design (a `rotary_interleaved` constructor argument). It now uses upstream's.
 - Upstream also has a Cohere2 adapter and tests, which this repository lacks, so this repository is behind upstream `dev`.
 - The PR author did not run `verify_models` or any gated checkpoint, so rows A1–A3 remain open upstream as well. Whether upstream addresses QK-norm or the `logit_scale` double application (defects 2 and 3) is unresolved.
+
+### F. Reconciliation with upstream PR #1873
+
+[V] Based on reading the PR diff (5 files: `transformer_bridge_config.py`, `position_embeddings_attention.py`, `cohere.py`, and the Cohere and Cohere2 unit tests). Nothing was executed; the tests below are **not run**.
+
+| Area | Upstream #1873 | This branch before | Conflict | Action taken |
+|---|---|---|---|---|
+| RoPE rotation | Config field `rotary_interleaved_cos_sin` (default `False`), module-level `_apply_rotary_pos_emb_interleaved_cos_sin`, dispatch via `getattr(self.config, ...)`; `cohere.py` sets `self.cfg.rotary_interleaved_cos_sin = True` | Constructor argument `rotary_interleaved` and a `_apply_rotary` method on the bridge | **Duplicate, conflicting.** Same arithmetic, different names and mechanism, in the same lines of two files. Syncing with upstream would have left two switches for one behaviour. | Replaced with upstream's field name, helper name and body, and adapter line. This also matches the repo convention of driving the attention bridge from config flags (`gated_q_proj`, `use_split_qkv_input`). When the flag is `False` the same Llama function is imported and called as on `main`. |
+| QK-norm (`use_qk_norm`) | Not touched. Upstream's parity tests use the default `use_qk_norm=False`. | Adapter declares `q_norm` / `k_norm`; new `per_head` phase | None. Additive. | Kept. Still unverified by either side. |
+| `logit_scale` after `process_weights` | Not touched. Upstream's parity tests never call `process_weights`. | `finalize_weight_processing` hook resets the HF runtime multiply | None. Additive. | Kept. Still unverified by either side. |
+| Tests | Unit-tier `TestCohereAdapterConfig::test_rotary_interleaved_cos_sin`, `..._defaults_to_false`, and `TestCohereParity::test_logits_match_hf` (synthetic `d_head = 8` model, widened weights, batch of 2) using an `assert_tiny_parity` helper | Integration-tier offline parity only | The upstream helper `assert_tiny_parity` does not exist in this repository. | Added the three tests under the same names in the unit file, with an explicit `< 1e-4` assertion in place of the missing helper. Existing rotation unit tests now call the module-level helper. |
+| Cohere2 | Parity test for `Cohere2ForCausalLM`; its adapter inherits the flag | No Cohere2 adapter exists here | Not applicable. | None. Out of scope; this repository is behind upstream `dev`. |
+
+Differences that remain against upstream, all unresolved until the two are actually merged:
+
+- This repository's `position_embeddings_attention.py` has no `rotary_adjacent_pairs` branch or `_apply_rotary_pos_emb_adjacent_pairs` helper, which upstream's dispatch chains after the new flag. A merge will still need a manual resolution there.
+- The partial-rotary path here applies the selected rotation to the rotated slice. How upstream handles that case is not visible in the diff.
+- One fixture detail changed for safety: the offline integration fixture no longer passes `attn_implementation="eager"` to `CohereConfig(...)` and relies on setting `_attn_implementation` after construction, the pattern `test_glm_moe_dsa_adapter.py` already uses.
 
 ## 8. Recommendation
 

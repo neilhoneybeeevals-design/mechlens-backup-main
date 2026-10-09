@@ -8,7 +8,7 @@ Supports CohereForCausalLM models (Command-R family) with:
 - Logit scaling: output logits multiplied by config.logit_scale (default 1/16)
 - Tied embed/unembed weights by default (tie_word_embeddings=True)
 - Interleaved RoPE: cos/sin come from CohereRotaryEmbedding; the attention bridge
-  applies them with Cohere's adjacent-pair rotation (rotary_interleaved=True)
+  applies them with Cohere's adjacent-pair rotation (cfg.rotary_interleaved_cos_sin)
 - Optional per-head QK LayerNorm (use_qk_norm=True, e.g. Command-R+)
 """
 
@@ -75,6 +75,11 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
 
         # --- Parallel block: single norm, no post_attention_layernorm ---
         self.cfg.parallel_attn_mlp = True
+
+        # --- RoPE convention ---
+        # CohereRotaryEmbedding repeat-interleaves cos/sin and HF's rotate_half
+        # pairs adjacent elements; the attention bridge must rotate the same way.
+        self.cfg.rotary_interleaved_cos_sin = True
 
         # --- Tokenizer: BOS is prepended by default ---
         # CohereTokenizerFast has add_bos_token=False but HF's __call__ with
@@ -143,7 +148,7 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
         # mode: single ln1 feeds both attn and MLP; NO ln2.
         # Submodule shapes follow Llama: separate q/k/v/o projections and SwiGLU MLP.
         # cos/sin come from HF's CohereRotaryEmbedding; the rotation itself runs in
-        # the attention bridge, which is why rotary_interleaved=True is required.
+        # the attention bridge, which is why cfg.rotary_interleaved_cos_sin is set.
         self.component_mapping = {
             # Embedding: model.embed_tokens (same root as Llama, not transformer.* like Falcon)
             "embed": EmbeddingBridge(name="model.embed_tokens"),
@@ -164,7 +169,6 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
                         submodules=attn_submodules,
                         requires_attention_mask=True,
                         requires_position_embeddings=True,
-                        rotary_interleaved=True,
                     ),
                     # GatedMLPBridge: gate/in/out matches Llama's gate_proj/up_proj/down_proj.
                     "mlp": GatedMLPBridge(
