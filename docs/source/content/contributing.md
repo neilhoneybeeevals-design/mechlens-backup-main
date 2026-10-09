@@ -283,7 +283,7 @@ Adapters live in `transformer_lens/model_bridge/supported_architectures/<model_n
 1. **`transformer_lens/model_bridge/supported_architectures/__init__.py`** — import the adapter class and add it to `__all__`. The package fails to import at boot if this is missed.
 2. **`transformer_lens/factories/architecture_adapter_factory.py`** — import the class and add it to the `SUPPORTED_ARCHITECTURES` dict. The dict key must match `config.architectures[0]` exactly; otherwise `boot_transformers` raises "unsupported architecture."
 3. **`transformer_lens/tools/model_registry/__init__.py`** — add the architecture name to `HF_SUPPORTED_ARCHITECTURES` (the set) and `CANONICAL_AUTHORS_BY_ARCH` (the foundation-orgs map). Without this, the HF scraper won't discover canonical models for the new architecture.
-4. **`transformer_lens/tools/model_registry/generate_report.py`** — add a one-line entry to `ARCHITECTURE_DESCRIPTIONS` so the generated coverage table covers the new architecture.
+4. **`transformer_lens/tools/model_registry/generate_report.py`** — add a one-line entry to `ARCHITECTURE_DESCRIPTIONS`. Without it the generated report falls back to an auto-generated description.
 
 If you want a starter file, copy [adapter-template.py](../_static/adapter-template.py) into `supported_architectures/` and rename it.
 
@@ -305,7 +305,7 @@ Two test layers:
 ### Common adapter gotchas
 
 - **HF raw config attributes are invisible to TL-side consumers unless explicitly propagated to `self.cfg`.** Walk the HF `config.json` and mirror any non-standard knobs (`final_logit_softcapping`, `attn_logit_softcapping`, `query_pre_attn_scalar`, `sliding_window`, `layer_types`) onto `self.cfg` so weight processing and forward passes can see them.
-- **Some config attrs need both surface-on-cfg AND fold-into-weight** via a `preprocess_weights()` override. The trigger: a numerical operation HF's forward applies natively must also be baked into the raw weights, or `bridge.enable_compatibility_mode()` (which calls `process_weights` on raw weights) produces wrong results. Concrete examples in-tree: Cohere `logit_scale` → `unembed.weight`; Gemma embedding scale (`√d_model`) → `embed.weight`. Skip the fold and Phase 3 / Phase 4 of `verify_models` will silently degrade.
+- **Some config attrs need both surface-on-cfg AND fold-into-weight** via a `preprocess_weights()` override. The trigger: a numerical operation HF's forward applies natively must also be baked into the raw weights, or `bridge.enable_compatibility_mode()` (which calls `process_weights` on raw weights) produces wrong results. Concrete example in-tree: Cohere `logit_scale` → `unembed.weight`. Gemma's embedding scale (`√d_model`) is **not** folded: HF applies it inside the embedding module the bridge wraps, so the Gemma adapters leave `embed.weight` unscaled. Skip the fold and Phase 3 / Phase 4 of `verify_models` will silently degrade.
 - **Tokenizer policy is per-model, not per-architecture.** Sibling models in the same family routinely differ — the chat-instruct variant may prepend BOS where the base does not, padding side can flip, EOS handling can differ. It's worth re-checking `default_prepend_bos`, padding side, and EOS handling against the specific target rather than copying them from a starter adapter. `tokenizer_config.json` is not always reliable on its own — some architectures (Cohere is a notable example) declare `add_bos_token=False` but HF's `__call__` prepends BOS anyway. The most reliable check is to invoke the tokenizer directly:
 
   ```python

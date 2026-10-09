@@ -36,7 +36,7 @@ The first hop where they disagree localizes the bug.
 |---|---|---|
 | Logits off everywhere but Q/K/V close | RoPE base / scaling mismatch | Adapter's `RotaryEmbeddingBridge` setup; check `cfg.rotary_base`, `cfg.rope_scaling` |
 | Attention output drifts; Q / K / V match | Wrong `n_key_value_heads`, wrong head reshape | `_qkvo_weight_conversions(n_kv_heads=...)`; GQA-aware split |
-| First-layer outputs off; embeddings off | Embedding scaling missing (Gemma, T5) | `preprocess_weights()` override; `cfg.scale_embeddings` |
+| First-layer outputs off; embeddings off | Embedding scaling missing or applied twice (Gemma, XGLM scale inside the HF embedding module) | Confirm `embed` wraps the scaling module and that nothing pre-scales `embed.weight` |
 | Off by a constant scale in residual | Final-RMS-norm offset missing | `cfg.rmsnorm_uses_offset = True` + `ArithmeticTensorConversion(ADDITION, 1.0)` |
 | Logits flat / saturated at extremes | Missing logit softcap | `cfg.output_logits_soft_cap` from HF's `final_logit_softcapping` |
 | Attention pattern collapses to argmax | Missing attention-score softcap | `cfg.attn_scores_soft_cap` from HF's `attn_logit_softcapping` |

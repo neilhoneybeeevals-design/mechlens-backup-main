@@ -63,7 +63,7 @@ class MyArchitectureAdapter(ArchitectureAdapter):
 Optional overrides on the class:
 
 - `default_cfg` — class-level defaults merged into the runtime config
-- `preprocess_weights()` — pre-load weight transforms (e.g. Gemma embedding scaling, Cohere `logit_scale` fold). See [When to override `preprocess_weights`](#when-to-override-preprocess_weights).
+- `preprocess_weights()` — pre-load weight transforms (e.g. Cohere `logit_scale` fold, Phi-3 / InternLM2 / Baichuan manual LN fold). See [When to override `preprocess_weights`](#when-to-override-preprocess_weights).
 - `applicable_phases` — subset of `[1, 2, 3, 4, 7, 8]` (default `[1, 2, 3, 4]`); see [tools/model_registry/AGENTS.md](../../tools/model_registry/AGENTS.md) for what each phase tests
 - `supports_generation` — set `False` for encoder-only models (BERT, HuBERT)
 
@@ -104,8 +104,8 @@ HF raw config attributes are invisible to TL-side consumers unless propagated to
 | HF attribute | Fold target | Used by |
 |---|---|---|
 | `logit_scale` | `unembed.weight` (multiply in fp32 then cast back) | Cohere — final logits scaled by `1/16` |
-| `embedding_multiplier` / embed-scale flags | `embed.weight` (multiply) | Gemma — embeddings scaled by `√d_model` |
-| Tied unembed with extra scale | `unembed.weight` | T5-family tied projection variants |
+
+`cohere.py` is the only in-tree adapter that folds a config scalar this way. Embedding scales are **not** folded: Gemma 1/2/3 and XGLM scale by `√d_model` inside the HF embedding module that `bridge.embed` wraps, and the Gemma adapters state explicitly that `embed.weight` must not be pre-scaled. The T5 adapters define no `preprocess_weights` either.
 
 Rule of thumb: if the model card or HF source mentions a numerical knob, assume it needs to land on `self.cfg`. If that knob changes weights or final outputs and HF's forward applies it natively, you ALSO need a `preprocess_weights` override or compatibility mode will diverge.
 
@@ -122,7 +122,9 @@ Default is a no-op pass-through. Override when a numerical op HF applies nativel
 Examples:
 
 - **Cohere** — `cfg.logit_scale` (default `0.0625`) folds into `unembed.weight`. HF forward multiplies logits by `logit_scale`; compat-mode doesn't.
-- **Gemma1/2/3** — embedding scale (`√d_model`) folds into `embed.weight`. HF's `GemmaTextScaledWordEmbedding` scales on forward; compat-mode reads raw.
+- **Phi-3, InternLM2, Baichuan** — LayerNorm folding done manually here because a fused projection rules out the standard fold.
+
+Counter-example: **Gemma1/2/3** scale embeddings by `√d_model` in `GemmaTextScaledWordEmbedding.forward`, but do **not** fold. The wrapped module applies the scale on every path, so `gemma1.py` / `gemma2.py` / `gemma3.py` say explicitly that weights must not be pre-scaled.
 
 Skeleton:
 
@@ -220,7 +222,7 @@ After writing `myarch.py` with `MyArchitectureAdapter`, register in **all four**
    ```python
    "MyArchForCausalLM": "Short human-readable description.",
    ```
-   Missing → generated docs table omits the new architecture.
+   Missing → the generated report falls back to an auto-generated description (`"<Name> architecture for causal language modeling"`).
 
 **Verify the four-place wiring**: [`TestRegistrySyncedWithFactory`](../../../tests/unit/tools/test_model_registry.py) asserts four bidirectional invariants across `SUPPORTED_ARCHITECTURES`, `HF_SUPPORTED_ARCHITECTURES`, `CANONICAL_AUTHORS_BY_ARCH`. Run:
 
@@ -301,7 +303,7 @@ Two test layers per architecture, both required for review:
 
 ### 1. Unit adapter test — `tests/unit/model_bridge/supported_architectures/test_<arch>_adapter.py`
 
-26 of these exist; they all follow the same shape. Copy from a sibling that matches your architecture's quirks:
+57 of these exist, though not every architecture has one yet (e.g. `deepseek_v2.py` / `deepseek_v3.py` have integration tests only); they all follow the same shape. Copy from a sibling that matches your architecture's quirks:
 
 - **Standard decoder LM** template: [`test_gemma1_adapter.py`](../../../tests/unit/model_bridge/supported_architectures/test_gemma1_adapter.py) or [`test_gpt2_adapter.py`](../../../tests/unit/model_bridge/supported_architectures/test_gpt2_adapter.py)
 - **GQA / modern RMSNorm+RoPE** template: [`test_qwen3_adapter.py`](../../../tests/unit/model_bridge/supported_architectures/test_qwen3_adapter.py)

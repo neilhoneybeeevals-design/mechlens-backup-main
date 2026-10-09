@@ -121,7 +121,30 @@ Also verified in this repository:
 - What replaced `cross_model`, and whether any current benchmark still skips value comparison in a way that could pass a wrong-RoPE model.
 - Whether "#1126" and "#1127" were meant to refer to something other than these upstream PRs. If so, this section needs redoing against the right source.
 
-## 6. Recommendation
+## 6. Model-support claims versus implementation
+
+Reconciled on 2026-10-09 by reading the adapters, the three registration sites, `ARCHITECTURE_DESCRIPTIONS`, and `supported_models.json` (generated 2026-06-25; 12,899 entries, 65 architectures, 1,017 verified). `docs/source/_static/supported_models.json`, which feeds the published support matrix, is byte-identical to the registry file. Nothing here was executed. Registry counts are the recorded results of earlier `verify_models` runs, not re-verified.
+
+| Family | Adapter file / factory key | Registry (verified / failed / skipped / untested) | Documentation claim | Finding |
+|---|---|---|---|---|
+| Command-R, Command-R+, Aya | `cohere.py` / `CohereForCausalLM` | 1 / 1 / 17 / 0 | "Cohere's Command models"; release notes list Cohere as supported | Registered in all sites. Overstated: no real checkpoint is verified, and on `main` logits diverge from HF for `d_head > 2` (section 1). Command R7B and Command A use `Cohere2ForCausalLM`, which has no adapter. Description narrowed accordingly. |
+| DeepSeek V2 | `deepseek_v2.py` / `DeepseekV2ForCausalLM` | 0 / 1 / 29 / 0 | Covered by "DeepSeek V2/V3/R1" MLA notes | Registered, but **zero verified models**. The one model that ran (`yujiepan/deepseek-v2-0628-tiny-random`) failed Phase 1 at 0%. Had no report description; added. |
+| DeepSeek V3 | `deepseek_v3.py` / `DeepseekV3ForCausalLM` | 2 / 5 / 53 / 0 | Same | Registered. Both verified entries are tiny random models, each "with issues" (`P3=89.5%`). Five tiny models failed Phase 1, including both `trl-internal-testing` ones. No full-size checkpoint has run. Had no report description; added. |
+| DeepSeek R1 | No separate adapter; R1 loads as `DeepseekV3ForCausalLM` | 0 verified of 10 R1-named V3 entries (all skipped: size or quantization) | "DeepSeek V2/V3/R1" | The routing claim is accurate: the adapter docstring and the registry both put R1 on the V3 architecture. R1 itself has never been verified. Most R1-named registry entries are distillations on other architectures (74 Qwen2, 34 Llama) and say nothing about this adapter. |
+| Gemma 1 / 2 / 3 | `gemma1.py`, `gemma2.py`, `gemma3.py` | 26 / 2 / 14 / 36; 24 / 0 / 51 / 32; 21 / 19 / 22 / 120 | Several docs said the `√d_model` embedding scale is folded into `embed.weight` via `preprocess_weights` | **Documentation was wrong.** No Gemma adapter defines `preprocess_weights`; each says the scale is applied at runtime by the wrapped HF embedding module and must not be pre-scaled. Docs corrected. Gemma 3 has 19 failed entries. |
+| Gemma 3 multimodal, 3n, 4 | `gemma3_multimodal.py`, `gemma3n.py`, `gemma4.py` | 11 / 6 / 17 / 21; 1 / 3 / 0 / 0; 7 / 0 / 16 / 33 | Described as text-only for 3n and 4 | `Gemma3ForConditionalGeneration` had no report description; added. `Gemma4UnifiedForConditionalGeneration` routes to `gemma4.py` and has zero verified models (18 skipped). |
+| T5Gemma | `t5gemma.py` | 0 / 20 / 0 / 6 | Listed as supported | Registered, but every model that ran failed. |
+
+Other verified discrepancies:
+
+- `ARCHITECTURE_DESCRIPTIONS` lacks entries for 24 of the 66 architectures in `HF_SUPPORTED_ARCHITECTURES`. The docs said a missing entry drops the architecture from the generated table; the code falls back to an auto-generated description instead. Docs corrected. Three entries were added (above); the other 21 are still missing.
+- `tests/unit/model_bridge/supported_architectures/` has 57 adapter test files, not 26, and none for `deepseek_v2.py` or `deepseek_v3.py`, although the adapter guide calls a unit adapter test mandatory. Count corrected; the tests were not written.
+- `debugging_numerical_divergence.md` pointed at `cfg.scale_embeddings`, which does not exist anywhere under `transformer_lens/`. Corrected.
+- `NemotronHForCausalLM` has an adapter and is in `HF_SUPPORTED_ARCHITECTURES`, yet has no registry entries and is still listed in `architecture_gaps.json` as unsupported. Both data files are generated, so they were left alone; they need a fresh scrape.
+
+Left unchanged on purpose: `news/release-3.0.md` (a dated release essay), the registry and gaps data files (only `verify_models` and the scraper may write them), and the "DeepSeek V2 / V3 / R1" MLA notes in `compatibility_mode.md` and `migrating_to_v3.md`, which describe block structure and match the code.
+
+## 7. Recommendation
 
 **BLOCKED / NO-GO** for releasing Command-R support and for merging the shared attention bridge change into a release branch.
 

@@ -243,7 +243,7 @@ def setup_component_testing(self, hf_model, bridge_model=None):
 
 ### `preprocess_weights(state_dict)`
 
-Apply architecture-specific weight transformations before standard processing. Example: Gemma scales embeddings by `sqrt(d_model)`.
+Apply architecture-specific weight transformations before standard processing. Example: Cohere folds `logit_scale` into `unembed.weight`. (Gemma's `sqrt(d_model)` embedding scale is applied at runtime by the wrapped HF embedding module and is not folded.)
 
 ### `prepare_loading(model_name, model_kwargs)`
 
