@@ -4,7 +4,7 @@ orphan: true
 
 # Release Readiness — Command-R (Cohere) Model Support
 
-**Status: BLOCKED / NO-GO.** Last updated 2026-10-09. The ordered list of checks, owners and pass criteria is in [section 9](#9-fastest-path-to-release-readiness). Branch `fix/cohere-rope-qknorm-logit-scale`, code commit `1b7c4a9` (base `main` @ `a4c3648`).
+**Status: BLOCKED / NO-GO.** Last updated 2026-10-09. The ordered list of checks, owners and pass criteria is in [section 9](#9-fastest-path-to-release-readiness). Branch `fix/cohere-rope-qknorm-logit-scale` (base `main` @ `a4c3648`). Code changes are in `1b7c4a9`, `68dbd36`, `1008f60` and `56ddd53`; the other commits are documentation.
 
 The Command-R fixes below have **not been executed**. No test in this repository has been run against them. Do not release Command-R support, or anything depending on the shared attention bridge changes, until the [exit criteria](#exit-criteria) are met.
 
@@ -300,7 +300,7 @@ Three states, used consistently here, in `Adapters/adapter_support_matrix.xlsx`,
 
 ### Support matrix file
 
-[V] `Adapters/adapter_support_matrix.xlsx` did not exist in this repository or its history. A Google Sheet titled "Model-adapater support matrix.xlsx" exists in the project Drive with 13 families, all marked `supported`, and no Command-R or DeepSeek rows. The repository file was created in this commit from that sheet: its 13 rows and its `coverage` tab are copied unchanged, and six rows were added (Command-R; DeepSeek V2, V3, R1; and two unsupported groups) with a status key. The Drive sheet itself was not modified. The copied rows were **not** re-verified, and several do not obviously correspond to this codebase (for example the "since TL version" values and a LLaMA-4 row), so the header line "Every family ships a weight-conversion acceptance test" is unconfirmed for them. The `coverage` counts were left as they were; no family was added to the supported total.
+[V] `Adapters/adapter_support_matrix.xlsx` did not exist in this repository or its history. A Google Sheet titled "Model-adapater support matrix.xlsx" exists in the project Drive with 13 families, all marked `supported`, and no Command-R or DeepSeek rows. The repository file was created in this commit from that sheet: its 13 rows and its `coverage` tab are copied unchanged, and six rows were added (Command-R; DeepSeek V2, V3, R1; and two unsupported groups) with a status key. The Drive sheet itself was not modified. The copied rows' acceptance results were **not** verified. A later pass added a "repository check" column recording what this repository shows for every row. For the 13 copied rows: 8 checkpoints are in the HookedTransformer list (`transformer_lens/supported_models.py`), of which 7 are also verified in the Bridge registry (`gpt2` under the id `openai-community/gpt2`) and one (`EleutherAI/gpt-neox-20b`) is skipped there; 2 rows are **contradicted** (LLaMA-4 and Qwen-2.5-VL: checkpoint in neither list, architecture listed as unsupported in `architecture_gaps.json`); 2 have a checkpoint id that matches nothing exactly (Gemma-3, Phi-3; the `-it` / `-pt` / `-instruct` variants exist and are verified); 1 is unconfirmed (Mistral-Small-3). The "since TL version" values cannot be checked: this repository's package version is `0.0.0`. The header line "Every family ships a weight-conversion acceptance test" is therefore unconfirmed, and false as written for at least the two contradicted rows. The `coverage` counts were left as they were; no family was added to the supported total.
 
 ### Other criteria
 
@@ -356,7 +356,34 @@ Run top to bottom and stop at the first failure. Steps 1–3 need no Hugging Fac
 
 **If a step fails:** fix on the branch, re-run that step and every earlier one, and do not loosen a tolerance or add a skip to get past it.
 
-## 10. Recommendation
+## 10. Final audit checklist (2026-10-09)
+
+No written list of 18 release-readiness criteria was found in this repository, the project Drive or the project mailbox. The 18 items below are a reconstruction from the requests made during this work and the written acceptance methodology; replace them if an authoritative list exists. PASS means the evidence was checked directly. No PASS here rests on a test run, because none has run.
+
+| # | Criterion | Status | Evidence |
+|---|---|---|---|
+| 1 | Highest-impact Command-R gap identified and fixed in code | BLOCKED | Fixes for RoPE, QK-norm and `logit_scale` are on the branch; none executed |
+| 2 | Changes committed and pushed to the remote branch | PASS | `git ls-remote` equals local `HEAD`; working tree clean |
+| 3 | Command-R unit and offline parity tests pass | BLOCKED | `ModuleNotFoundError: No module named 'torch'`; `pypi.org` returns 403 |
+| 4 | Format and type checks pass with pinned tools | BLOCKED | `make check-format`, `uv run mypy .` not runnable; unpinned tools show nothing new versus `main` |
+| 5 | Release-readiness document records fixes, files, checks, blocked tests and risks | PASS | This file, sections 1–4 |
+| 6 | Impact of #1126 / #1127 stated, facts separated from open questions | PASS | Section 5, including the correction; which tracker the numbers belong to is unresolved |
+| 7 | Explicit BLOCKED / NO-GO recommendation | PASS | Header and section 11 |
+| 8 | Model-support documentation matches the implementation (Command-R, DeepSeek, Gemma) | PASS | Section 6; Gemma fold claims corrected in five documents |
+| 9 | Prioritised verification matrix with evidence, status, impact, next action | PASS | Section 7 |
+| 10 | Acceptance test exists and compares against Hugging Face at 1e-4 max absolute difference | PASS | `TestCohereRealCheckpointLogitParity`; deviation: TransformerBridge, not HookedTransformer |
+| 11 | Acceptance test passes on the smallest public checkpoint, log saved | BLOCKED | Never run; needs `torch` and Hub access |
+| 12 | No duplicate or conflicting fix relative to upstream PR #1873 | PASS | Section 7F; flag and helper names match upstream's diff |
+| 13 | Command-R row present in `Adapters/adapter_support_matrix.xlsx` | PASS | Row 18, status "implemented, unverified" |
+| 14 | Documentation separates implemented, unverified and unsupported families, including DeepSeek V2 / V3 / R1 | PASS | Section 8, `model_tables.md`, matrix rows 19–23 |
+| 15 | Command-R registry entries are consistent with the released code and verified | FAIL | 19 entries: 1 verified (a `d_head = 2` model), 1 failed, 17 skipped; all predate the fix |
+| 16 | Existing adapter tests pass (no regression) | BLOCKED | Not run on the branch. Baseline is already FAIL: CI run 37984279901 on `main` failed Unit Test on 3.10 / 3.11 / 3.12 and Type Check |
+| 17 | Status email exists as a Gmail draft and is unsent | PASS | Draft `r1685509882029817192` carries only the DRAFT label; nothing with that subject in Sent |
+| 18 | Draft is addressed to a verified TransformerLens maintainer | FAIL | Addressed to `bram.giraffetasks@gmail.com`, chosen by the repository owner. No source lists this address as a maintainer; the named maintainers have no listed email |
+
+Totals: 10 PASS, 2 FAIL, 6 BLOCKED.
+
+## 11. Recommendation
 
 **BLOCKED / NO-GO** for releasing Command-R support and for merging the shared attention bridge change into a release branch.
 
