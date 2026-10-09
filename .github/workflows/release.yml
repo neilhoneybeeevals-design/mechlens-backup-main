@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  checks:
+    name: Run checks workflow
+    uses: ./.github/workflows/checks.yml
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  semver-parser:
+    name: Parse the semantic version from the release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          activate-environment: true
+          enable-cache: true
+
+      - name: Install packaging
+        run: uv pip install packaging
+
+      - name: Parse semver string
+        id: semver_parser
+        env:
+          RAW_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="${RAW_TAG#v}"
+          echo "Detected version: $VERSION"
+          echo "version=$(uv run python -c "from packaging.version import Version; print(Version('$VERSION'))")" >> $GITHUB_OUTPUT
+    outputs:
+      semver: "${{ steps.semver_parser.outputs.version }}"
+
+  release-python:
+    name: Release Python package to PyPi
+    needs:
+      - checks
+      - semver-parser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          activate-environment: true
+          enable-cache: true
+      - name: Install dependencies
+        run: |
+          uv lock --check
+          uv sync
+      - name: Set the version
+        run: make version-set VERSION=${{needs.semver-parser.outputs.semver}}
+      - name: re-sync
+        run: uv sync
+      - name: Build
+        run: uv build
+      - name: Publish
+        run: |
+          uv pip install twine
+          uv run twine upload --non-interactive -u __token__ -p "$PYPI_TOKEN_PYPI" dist/*
+        env:
+          PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN_PYPI }}

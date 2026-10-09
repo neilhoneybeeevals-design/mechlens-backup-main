@@ -1,0 +1,442 @@
+"""Block bridge component.
+
+This module contains the bridge component for transformer blocks.
+"""
+from __future__ import annotations
+
+import inspect
+import re
+import weakref
+from typing import Any, Callable, Dict, Optional, cast
+
+import torch
+
+from transformer_lens.hook_points import HookPoint
+from transformer_lens.model_bridge.exceptions import StopAtLayerException
+from transformer_lens.model_bridge.generalized_components.base import (
+    GeneralizedComponent,
+)
+
+# Layer-type variant submodule names. Tuple for deterministic iteration order.
+# Extend here when adding new hybrid variant types.
+VARIANT_SUBMODULE_NAMES: tuple[str, ...] = ("attn", "linear_attn", "mamba", "mixer", "ssm")
+_VARIANT_SUBMODULE_SET: frozenset[str] = frozenset(VARIANT_SUBMODULE_NAMES)
+
+# Infrastructure modules excluded from submodule introspection.
+_BLOCK_INTERNAL_MODULES: frozenset[str] = frozenset({"hook_in", "hook_out", "_original_component"})
+
+# Norm-module prefixes excluded from layer_types() labels.
+_NORM_PREFIXES: tuple[str, ...] = ("ln", "layer_norm", "norm", "rms")
+
+
+class BlockBridge(GeneralizedComponent):
+    """Bridge component for transformer blocks.
+
+    This component provides standardized input/output hooks and monkey-patches
+    HuggingFace blocks to insert hooks at positions matching HookedTransformer.
+    """
+
+    is_list_item: bool = True
+    # hook_mlp_in is a direct HookPoint on this class (not aliased) so it can
+    # fire pre-ln2; see __init__. The post-ln2 mlp input stays at block.mlp.hook_in.
+    hook_aliases = {
+        "hook_resid_pre": "hook_in",
+        "hook_resid_mid": "ln2.hook_in",
+        "hook_resid_post": "hook_out",
+        "hook_attn_in": "attn.hook_attn_in",
+        "hook_attn_out": "attn.hook_out",
+        "hook_q_input": "attn.hook_q_input",
+        "hook_k_input": "attn.hook_k_input",
+        "hook_v_input": "attn.hook_v_input",
+        "hook_mlp_out": "mlp.hook_out",
+    }
+
+    def __init__(
+        self,
+        name: str,
+        config: Optional[Any] = None,
+        submodules: Optional[Dict[str, GeneralizedComponent]] = None,
+        hook_alias_overrides: Optional[Dict[str, str]] = None,
+    ):
+        """Initialize the block bridge.
+
+        Args:
+            name: The name of the component in the model
+            config: Optional configuration (unused for BlockBridge)
+            submodules: Dictionary of submodules to register
+            hook_alias_overrides: Optional dictionary to override default hook aliases.
+                For example, {"hook_attn_out": "ln1_post.hook_out"} will make hook_attn_out
+                point to ln1_post.hook_out instead of the default attn.hook_out.
+        """
+        # ln1_post/ln2_post redirect attn_out/mlp_out to match HookedTransformer's
+        # placement (hook fires after the post-norm, not before).
+        auto_overrides = {}
+        if submodules is not None:
+            if "ln1_post" in submodules:
+                auto_overrides["hook_attn_out"] = "ln1_post.hook_out"
+            if "ln2_post" in submodules:
+                auto_overrides["hook_mlp_out"] = "ln2_post.hook_out"
+        merged_overrides = {**auto_overrides, **(hook_alias_overrides or {})}
+
+        # Guard against the C15 bug class: sequential transformer block (attn +
+        # mlp) with no ln2 would silently point hook_resid_mid at the wrong
+        # tensor. Use ParallelBlockBridge for parallel-residual architectures.
+        # Skip the check on generic-container / attn-only uses (no mlp).
+        has_attn_like = submodules is not None and any(
+            k in submodules for k in _VARIANT_SUBMODULE_SET
+        )
+        has_mlp = submodules is not None and "mlp" in submodules
+        has_ln2 = submodules is not None and "ln2" in submodules
+        if has_attn_like and has_mlp and not has_ln2 and type(self) is BlockBridge:
+            raise ValueError(
+                f"BlockBridge at '{name}': 'ln2' submodule not declared. "
+                f"Either declare ln2, or use ParallelBlockBridge for a "
+                f"parallel-residual architecture."
+            )
+
+        # Call parent with merged overrides
+        super().__init__(
+            name,
+            config,
+            submodules=submodules if submodules is not None else {},
+            hook_alias_overrides=merged_overrides if merged_overrides else None,
+        )
+
+        self._original_block_forward: Optional[Callable[..., Any]] = None
+        self._pre_ln_capture_wired: bool = False
+        self._pre_ln_capture_handles: list[torch.utils.hooks.RemovableHandle] = []
+        # Fallback for _read_use_hook_mlp_in when block.config is None.
+        self._use_hook_mlp_in: bool = False
+        # Fires pre-ln2 when use_hook_mlp_in is set. See #1317.
+        self.hook_mlp_in = HookPoint()
+
+    def _maybe_wire_pre_ln_capture(self) -> None:
+        """Install ln1/ln2 forward_pre_hooks that feed the bridge's pre-LN hooks (#1317).
+
+        Hooks register on the NormalizationBridge instance, not on
+        ``original_component`` — the manual (non-native-autograd) bridge
+        forward never calls the raw module, so a hook there would silently miss
+        on most adapters. Idempotent.
+        """
+        if self._pre_ln_capture_wired:
+            return
+        from transformer_lens.model_bridge.generalized_components.attention import (
+            AttentionBridge,
+        )
+
+        ln1 = self.submodules.get("ln1") if self.submodules else None
+        attn = self.submodules.get("attn") if self.submodules else None
+        if (
+            ln1 is not None
+            and isinstance(attn, AttentionBridge)
+            and getattr(attn, "supports_split_qkv_fork", False)
+            and getattr(ln1, "original_component", None) is not None
+        ):
+            attn_ref = cast(AttentionBridge, weakref.proxy(attn))
+
+            def _capture_pre_ln1(_module: torch.nn.Module, args: tuple) -> None:
+                if args and isinstance(args[0], torch.Tensor):
+                    attn_ref._captured_pre_ln_residual = args[0]
+
+            handle = ln1.register_forward_pre_hook(_capture_pre_ln1)
+            self._pre_ln_capture_handles.append(handle)
+            attn._ln1_module = ln1.original_component
+
+        ln2 = self.submodules.get("ln2") if self.submodules else None
+        if ln2 is not None and getattr(ln2, "original_component", None) is not None:
+            hook_mlp_in = self.hook_mlp_in
+            block_ref = weakref.proxy(self)
+
+            def _capture_pre_ln2(_module: torch.nn.Module, args: tuple) -> Any:
+                if not block_ref._read_use_hook_mlp_in():
+                    return None
+                if args and isinstance(args[0], torch.Tensor):
+                    hooked = hook_mlp_in(args[0])
+                    return (hooked,) + args[1:]
+                return None
+
+            handle = ln2.register_forward_pre_hook(_capture_pre_ln2)
+            self._pre_ln_capture_handles.append(handle)
+
+        self._pre_ln_capture_wired = True
+
+    def _teardown_pre_ln_capture(self) -> None:
+        """Remove the ln1/ln2 forward_pre_hooks installed by _maybe_wire_pre_ln_capture."""
+        for handle in self._pre_ln_capture_handles:
+            handle.remove()
+        self._pre_ln_capture_handles.clear()
+        self._pre_ln_capture_wired = False
+
+    def _read_use_hook_mlp_in(self) -> bool:
+        """Prefer ``block.config.use_hook_mlp_in``; fall back to the block-local flag."""
+        cfg = self.config
+        if cfg is not None and hasattr(cfg, "use_hook_mlp_in"):
+            return bool(cfg.use_hook_mlp_in)
+        return self._use_hook_mlp_in
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Forward pass through the block bridge.
+
+        Args:
+            *args: Input arguments
+            **kwargs: Input keyword arguments
+
+        Returns:
+            The output from the original component
+
+        Raises:
+            StopAtLayerException: If stop_at_layer is set and this block should stop execution
+        """
+        if self.original_component is None:
+            raise RuntimeError(
+                f"Original component not set for {self.name}. Call set_original_component() first."
+            )
+
+        self._maybe_wire_pre_ln_capture()
+        self._check_stop_at_layer(*args, **kwargs)
+        args, kwargs = self._hook_input_hidden_states(args, kwargs)
+
+        # Filter kwargs to only include parameters accepted by the original component
+        # This prevents errors when passing encoder-specific params to decoder-only models
+        filtered_kwargs = self._filter_kwargs_for_forward(kwargs, len(args))
+
+        output = self.original_component(*args, **filtered_kwargs)
+        force_tuple_for_bare_tensor = self._is_standalone_hidden_state_call(args, filtered_kwargs)
+        return self._apply_output_hook(
+            output, force_tuple_for_bare_tensor=force_tuple_for_bare_tensor
+        )
+
+    def _apply_output_hook(
+        self,
+        output: Any,
+        wrap_single_element: bool = True,
+        force_tuple_for_bare_tensor: bool = False,
+    ) -> Any:
+        """Hook the primary tensor in the output and return the result.
+
+        Args:
+            output: Raw output from the original component (tensor or tuple).
+            wrap_single_element: If True, single-element tuples stay as tuples after
+                hooking (default, required by most HF models). If False, single-element
+                tuples are unwrapped to a bare tensor (Bloom convention).
+            force_tuple_for_bare_tensor: If True, bare tensor outputs are wrapped into
+                a one-element tuple after hooking. This keeps standalone BlockBridge
+                calls compatible with HF block APIs that expose tuple-like block outputs,
+                while preserving tensor outputs during newer HF parent-model execution.
+        """
+        if isinstance(output, tuple) and len(output) > 0:
+            first = output[0]
+            if isinstance(first, torch.Tensor):
+                first = self.hook_out(first)
+                if len(output) == 1:
+                    return (first,) if wrap_single_element else first
+                output = (first,) + output[1:]
+            return output
+        if isinstance(output, torch.Tensor):
+            output = self.hook_out(output)
+            if force_tuple_for_bare_tensor and wrap_single_element:
+                return (output,)
+            return output
+        return output
+
+    @staticmethod
+    def _is_standalone_hidden_state_call(args: tuple, kwargs: dict) -> bool:
+        """Return True for direct block(hidden_states) style calls.
+
+        Transformers versions differ on whether parent model loops expect block
+        outputs as tuples or tensors. We preserve the original tensor return during
+        full-model execution, but expose tuple-like output for standalone component
+        calls so `output[0]` does not accidentally drop the batch dimension.
+        """
+        if len(args) == 1 and isinstance(args[0], torch.Tensor) and not kwargs:
+            return True
+        return (
+            len(args) == 0
+            and set(kwargs.keys()) == {"hidden_states"}
+            and isinstance(kwargs["hidden_states"], torch.Tensor)
+        )
+
+    def _check_stop_at_layer(self, *args: Any, **kwargs: Any) -> None:
+        """Check if execution should stop before this block. Raises StopAtLayerException.
+
+        The _stop_at_layer_idx attribute is set by the bridge's forward method.
+        Supports TL/GPT-2/LLaMA naming patterns for layer index extraction.
+        """
+        if not (hasattr(self, "_stop_at_layer_idx") and self._stop_at_layer_idx is not None):
+            return
+        if self.name is not None:
+            match = (
+                re.search(r"blocks\.(\d+)", self.name)
+                or re.search(r"\.h\.(\d+)", self.name)
+                or re.search(r"\.layers\.(\d+)", self.name)
+            )
+        else:
+            match = None
+        if match:
+            layer_idx = int(match.group(1))
+            if layer_idx == self._stop_at_layer_idx:
+                if len(args) > 0 and isinstance(args[0], torch.Tensor):
+                    input_tensor = args[0]
+                elif "hidden_states" in kwargs and isinstance(
+                    kwargs["hidden_states"], torch.Tensor
+                ):
+                    input_tensor = kwargs["hidden_states"]
+                else:
+                    raise ValueError(f"Cannot find input tensor to stop at layer {layer_idx}")
+                input_tensor = self.hook_in(input_tensor)
+                raise StopAtLayerException(input_tensor)
+
+    def _hook_input_hidden_states(self, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+        """Apply hook_in to the hidden_states input, whether in args or kwargs."""
+        if len(args) > 0 and isinstance(args[0], torch.Tensor):
+            hooked_input = self.hook_in(args[0])
+            args = (hooked_input,) + args[1:]
+        elif "hidden_states" in kwargs and isinstance(kwargs["hidden_states"], torch.Tensor):
+            kwargs["hidden_states"] = self.hook_in(kwargs["hidden_states"])
+        return args, kwargs
+
+    def _filter_kwargs_for_forward(
+        self, kwargs: Dict[str, Any], num_positional_args: int = 0
+    ) -> Dict[str, Any]:
+        """Filter kwargs to only include parameters accepted by original_component.forward().
+
+        This prevents TypeErrors when the bridge passes parameters (like encoder_attention_mask)
+        that aren't accepted by decoder-only models. It also removes any kwargs that would
+        conflict with positional arguments already being passed.
+
+        Args:
+            kwargs: The full set of keyword arguments
+            num_positional_args: Number of positional arguments being passed (to avoid conflicts)
+
+        Returns:
+            Filtered kwargs containing only accepted parameters
+        """
+        if self.original_component is None:
+            return kwargs
+
+        try:
+            # Get the signature of the original component's forward method
+            sig = inspect.signature(self.original_component.forward)
+            param_list = list(sig.parameters.keys())
+            valid_params = set(param_list)
+
+            # Check if the signature accepts **kwargs (VAR_KEYWORD)
+            accepts_var_keyword = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+
+            # If it accepts **kwargs, pass everything through
+            if accepts_var_keyword:
+                return kwargs
+
+            # Skip params already provided positionally
+            positional_param_names = set(param_list[:num_positional_args])
+
+            # Filter kwargs: include only if in signature AND not already provided positionally
+            filtered = {
+                k: v
+                for k, v in kwargs.items()
+                if k in valid_params and k not in positional_param_names
+            }
+            return filtered
+
+        except (ValueError, TypeError):
+            # If we can't inspect the signature, pass through all kwargs
+            # (better to potentially fail than to silently drop important params)
+            return kwargs
+
+
+class MLABlockBridge(BlockBridge):
+    """Block wrapping Multi-Head Latent Attention (DeepSeek V2/V3/R1).
+
+    MLA has no standalone q/k/v projections — Q flows through compressed
+    q_a_proj→q_a_layernorm→q_b_proj, and K/V share a joint kv_a_proj_with_mqa
+    entry point. There is no single HookPoint that represents "input that
+    becomes Q/K/V", so the block-level ``hook_q_input``/``hook_k_input``/
+    ``hook_v_input``/``hook_attn_in`` aliases do not apply. Type-level
+    distinction means a reader of the adapter sees ``MLABlockBridge`` and
+    knows those hooks are absent.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        config: Optional[Any] = None,
+        submodules: Optional[Dict[str, GeneralizedComponent]] = None,
+        hook_alias_overrides: Optional[Dict[str, str]] = None,
+    ):
+        super().__init__(
+            name,
+            config=config,
+            submodules=submodules,
+            hook_alias_overrides=hook_alias_overrides,
+        )
+        if self.hook_aliases is BlockBridge.hook_aliases:
+            self.hook_aliases = dict(self.hook_aliases)
+        for alias in ("hook_q_input", "hook_k_input", "hook_v_input", "hook_attn_in"):
+            self.hook_aliases.pop(alias, None)
+
+
+class ParallelBlockBridge(BlockBridge):
+    """Block where attn and MLP both read the pre-attention residual.
+
+    For GPT-J, NeoX, Pythia, Phi, Cohere, CodeGen, and some Falcon variants,
+    output = resid_pre + attn_out + mlp_out — no distinct post-attention
+    residual exists. Matches legacy HookedTransformer which omits hook_resid_mid
+    when ``cfg.parallel_attn_mlp=True``. Type-level distinction means a reader
+    of the adapter sees ``ParallelBlockBridge`` and knows the hook is absent.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        config: Optional[Any] = None,
+        submodules: Optional[Dict[str, GeneralizedComponent]] = None,
+        hook_alias_overrides: Optional[Dict[str, str]] = None,
+    ):
+        super().__init__(
+            name,
+            config=config,
+            submodules=submodules,
+            hook_alias_overrides=hook_alias_overrides,
+        )
+        # Ensure instance-level copy before mutating; base may have left the
+        # class-level dict shared when no overrides were passed.
+        if self.hook_aliases is BlockBridge.hook_aliases:
+            self.hook_aliases = dict(self.hook_aliases)
+        self.hook_aliases.pop("hook_resid_mid", None)
+
+
+class DelegatedAttentionBlockBridge(BlockBridge):
+    """Block whose attention is delegated wholesale to HF (no split-qkv fork).
+
+    For architectures with heterogeneous per-layer attention structure — e.g.
+    Gemma 4, where KV-shared layers have no ``k_proj``/``v_proj`` at all and
+    K==V layers have no ``v_proj`` — there is no uniform HookPoint that
+    represents "input that becomes Q/K/V", so the block-level ``hook_q_input``/
+    ``hook_k_input``/``hook_v_input``/``hook_attn_in`` aliases do not apply.
+    Type-level distinction means a reader of the adapter sees
+    ``DelegatedAttentionBlockBridge`` and knows those hooks are absent.
+    """
+
+    # Tell the component benchmark this block's attention is delegated wholesale
+    # to HF and cannot be tested in isolation (requires model-specific kwargs).
+    maintain_native_attention: bool = True
+
+    def __init__(
+        self,
+        name: str,
+        config: Optional[Any] = None,
+        submodules: Optional[Dict[str, GeneralizedComponent]] = None,
+        hook_alias_overrides: Optional[Dict[str, str]] = None,
+    ):
+        super().__init__(
+            name,
+            config=config,
+            submodules=submodules,
+            hook_alias_overrides=hook_alias_overrides,
+        )
+        if self.hook_aliases is BlockBridge.hook_aliases:
+            self.hook_aliases = dict(self.hook_aliases)
+        for alias in ("hook_q_input", "hook_k_input", "hook_v_input", "hook_attn_in"):
+            self.hook_aliases.pop(alias, None)

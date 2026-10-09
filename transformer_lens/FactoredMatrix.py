@@ -1,0 +1,367 @@
+"""Factored Matrix.
+
+Utilities for representing a matrix as a product of two matrices, and for efficient calculation of
+eigenvalues, norm and SVD.
+"""
+
+from __future__ import annotations
+
+from functools import cached_property
+from typing import Any, List, Protocol, Tuple, Union, cast, overload, runtime_checkable
+
+import torch
+from jaxtyping import Complex, Float
+
+import transformer_lens.utilities.tensors as tensor_utils
+
+
+@runtime_checkable
+class TensorLike(Protocol):
+    """Minimal tensor protocol that FactoredMatrix accepts in place of torch.Tensor.
+
+    Allows duck-typed inputs (e.g. jaxtyping wrappers, custom array types) that
+    aren't torch.Tensor subclasses but support the operations FactoredMatrix uses
+    when constructing, multiplying, and broadcasting its A and B factors.
+    """
+
+    @property
+    def ndim(self) -> int:
+        ...
+
+    @property
+    def shape(self) -> Any:
+        ...
+
+    def size(self, dim: int) -> int:
+        ...
+
+    def unsqueeze(self, dim: int) -> Any:
+        ...
+
+    def squeeze(self, dim: int) -> Any:
+        ...
+
+    def broadcast_to(self, shape: Any) -> Any:
+        ...
+
+    def __matmul__(self, other: Any) -> Any:
+        ...
+
+
+class FactoredMatrix:
+    """
+    Class to represent low rank factored matrices, where the matrix is represented as a product of two matrices. Has utilities for efficient calculation of eigenvalues, norm and SVD.
+    """
+
+    def __init__(
+        self,
+        A: Union[Float[torch.Tensor, "... ldim mdim"], TensorLike],
+        B: Union[Float[torch.Tensor, "... mdim rdim"], TensorLike],
+    ):
+        """Construct a FactoredMatrix from factors A and B.
+
+        A and B may be torch.Tensor or TensorLike duck types. TensorLike inputs
+        are only fully supported by matmul-family operations (``@``, ``AB``,
+        ``BA``); operations like ``svd()``, ``norm()``, ``transpose()``,
+        ``__getitem__``, and eigenvalue methods require both factors to be
+        actual torch.Tensor and will raise AttributeError on TensorLike inputs.
+        """
+        # Cast to Tensor for type-checker purposes. At runtime A and B may be
+        # TensorLike duck types; the class methods trust the protocol.
+        self.A: torch.Tensor = cast(torch.Tensor, A)
+        self.B: torch.Tensor = cast(torch.Tensor, B)
+        assert self.A.size(-1) == self.B.size(
+            -2
+        ), f"Factored matrix must match on inner dimension, shapes were a: {self.A.shape}, b:{self.B.shape}"
+        self.ldim = self.A.size(-2)
+        self.rdim = self.B.size(-1)
+        self.mdim = self.B.size(-2)
+        self.has_leading_dims = (self.A.ndim > 2) or (self.B.ndim > 2)
+        try:
+            self.shape = torch.broadcast_shapes(self.A.shape[:-2], self.B.shape[:-2]) + (
+                self.ldim,
+                self.rdim,
+            )
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Shape mismatch: Cannot broadcast leading dimensions. A has shape {self.A.shape}, B has shape {self.B.shape}. {str(e)}"
+            ) from e
+        try:
+            self.A = self.A.broadcast_to(self.shape[:-2] + (self.ldim, self.mdim))
+            self.B = self.B.broadcast_to(self.shape[:-2] + (self.mdim, self.rdim))
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Shape mismatch: Cannot broadcast tensors. A has shape {self.A.shape}, B has shape {self.B.shape}, expected broadcast shape {self.shape}. {str(e)}"
+            ) from e
+
+    @overload
+    def __matmul__(
+        self,
+        other: Union[
+            Float[torch.Tensor, "... rdim new_rdim"],
+            "FactoredMatrix",
+        ],
+    ) -> "FactoredMatrix":
+        ...
+
+    @overload
+    def __matmul__(  # type: ignore
+        self,
+        other: Float[torch.Tensor, "rdim"],
+    ) -> Float[torch.Tensor, "... ldim"]:
+        ...
+
+    def __matmul__(
+        self,
+        other: Union[
+            Float[torch.Tensor, "... rdim new_rdim"],
+            Float[torch.Tensor, "rdim"],
+            "FactoredMatrix",
+            TensorLike,
+        ],
+    ) -> Union["FactoredMatrix", Float[torch.Tensor, "... ldim"], TensorLike]:
+        if isinstance(other, FactoredMatrix):
+            return (self @ other.A) @ other.B
+        else:
+            if other.ndim < 2:
+                # It's a vector, so we collapse the factorisation and just return a vector
+                # Squeezing/Unsqueezing is to preserve broadcasting working nicely
+                return (self.A @ (self.B @ other.unsqueeze(-1))).squeeze(-1)
+            else:
+                assert (
+                    other.size(-2) == self.rdim
+                ), f"Right matrix must match on inner dimension, shapes were self: {self.shape}, other:{other.shape}"
+                if self.rdim > self.mdim:
+                    # other is Tensor or TensorLike; runtime delegates to
+                    # the appropriate __matmul__/__rmatmul__ overload.
+                    return FactoredMatrix(self.A, self.B @ cast(torch.Tensor, other))
+                else:
+                    return FactoredMatrix(self.AB, other)
+
+    @overload
+    def __rmatmul__(  # type: ignore
+        self,
+        other: Union[
+            Float[torch.Tensor, "... new_rdim ldim"],
+            "FactoredMatrix",
+        ],
+    ) -> "FactoredMatrix":
+        ...
+
+    @overload
+    def __rmatmul__(  # type: ignore
+        self,
+        other: Float[torch.Tensor, "ldim"],
+    ) -> Float[torch.Tensor, "... rdim"]:
+        ...
+
+    def __rmatmul__(  # type: ignore
+        self,
+        other: Union[
+            Float[torch.Tensor, "... new_rdim ldim"],
+            Float[torch.Tensor, "ldim"],
+            "FactoredMatrix",
+            TensorLike,
+        ],
+    ) -> Union["FactoredMatrix", Float[torch.Tensor, "... rdim"], TensorLike]:
+        if isinstance(other, FactoredMatrix):
+            return other.A @ (other.B @ self)
+        else:
+            assert (
+                other.size(-1) == self.ldim
+            ), f"Left matrix must match on inner dimension, shapes were self: {self.shape}, other:{other.shape}"
+            if other.ndim < 2:
+                # It's a vector, so we collapse the factorisation and just return a vector
+                return ((other.unsqueeze(-2) @ self.A) @ self.B).squeeze(-2)
+            elif self.ldim > self.mdim:
+                return FactoredMatrix(other @ self.A, self.B)
+            else:
+                return FactoredMatrix(other, self.AB)
+
+    def __mul__(self, scalar: Union[int, float, torch.Tensor]) -> FactoredMatrix:
+        """
+        Left scalar multiplication. Scalar multiplication distributes over matrix multiplication, so we can just multiply one of the factor matrices by the scalar.
+        """
+        if isinstance(scalar, torch.Tensor):
+            assert (
+                scalar.numel() == 1
+            ), f"Tensor must be a scalar for use with * but was of shape {scalar.shape}. For matrix multiplication, use @ instead."
+        return FactoredMatrix(self.A * scalar, self.B)
+
+    def __rmul__(self, scalar: Union[int, float, torch.Tensor]) -> FactoredMatrix:  # type: ignore
+        """
+        Right scalar multiplication. For scalar multiplication from the right, we can reuse the __mul__ method.
+        """
+        return self * scalar
+
+    @property
+    def AB(self) -> Union[Float[torch.Tensor, "*leading_dims ldim rdim"], TensorLike]:
+        """The product matrix - expensive to compute, and can consume a lot of GPU memory.
+
+        Returns a TensorLike when A or B is a non-Tensor TensorLike duck type.
+        """
+        return self.A @ self.B
+
+    @property
+    def BA(self) -> Float[torch.Tensor, "*leading_dims rdim ldim"]:
+        """The reverse product. Only makes sense when ldim==rdim"""
+        assert (
+            self.rdim == self.ldim
+        ), f"Can only take ba if ldim==rdim, shapes were self: {self.shape}"
+        return self.B @ self.A
+
+    @property
+    def T(self) -> FactoredMatrix:
+        return FactoredMatrix(self.B.transpose(-2, -1), self.A.transpose(-2, -1))
+
+    @cached_property
+    def _svd_cached(
+        self,
+    ) -> Tuple[
+        Float[torch.Tensor, "*leading_dims ldim mdim"],
+        Float[torch.Tensor, "*leading_dims mdim"],
+        Float[torch.Tensor, "*leading_dims rdim mdim"],
+    ]:
+        # Cache on the instance (frees with it) rather than class-level — fixes the lru_cache leak.
+        Ua, Sa, Vha = torch.linalg.svd(self.A, full_matrices=False)
+        Ub, Sb, Vhb = torch.linalg.svd(self.B, full_matrices=False)
+        Va = tensor_utils.transpose(Vha)
+        Vb = tensor_utils.transpose(Vhb)
+        middle = Sa[..., :, None] * tensor_utils.transpose(Va) @ Ub * Sb[..., None, :]
+        Um, Sm, Vhm = torch.linalg.svd(middle, full_matrices=False)
+        Vm = tensor_utils.transpose(Vhm)
+        return Ua @ Um, Sm, Vb @ Vm
+
+    def svd(
+        self,
+    ) -> Tuple[
+        Float[torch.Tensor, "*leading_dims ldim mdim"],
+        Float[torch.Tensor, "*leading_dims mdim"],
+        Float[torch.Tensor, "*leading_dims rdim mdim"],
+    ]:
+        """Singular Value Decomposition: returns ``(U, S, V)`` such that ``U @ S.diag() @ V.transpose(-2, -1) == M``."""
+        return self._svd_cached
+
+    @property
+    def U(self) -> Float[torch.Tensor, "*leading_dims ldim mdim"]:
+        return self.svd()[0]
+
+    @property
+    def S(self) -> Float[torch.Tensor, "*leading_dims mdim"]:
+        return self.svd()[1]
+
+    @property
+    def V(self) -> Float[torch.Tensor, "*leading_dims rdim mdim"]:
+        """Right singular vectors. ``M == U @ S.diag() @ V.transpose(-2, -1)``."""
+        return self.svd()[2]
+
+    @property
+    def Vh(self) -> Float[torch.Tensor, "*leading_dims rdim mdim"]:
+        """Deprecated alias for :attr:`V` — historically misnamed; returns V, not its conjugate transpose."""
+        import warnings
+
+        warnings.warn(
+            "FactoredMatrix.Vh has always returned V (right singular vectors), not Vh. "
+            "Use .V for the canonical name; for the actual Hermitian transpose use "
+            ".V.transpose(-2, -1). The .Vh alias will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.svd()[2]
+
+    @property
+    def eigenvalues(self) -> Complex[torch.Tensor, "*leading_dims mdim"]:
+        """
+        Eigenvalues of AB are the same as for BA (apart from trailing zeros), because if BAv=kv ABAv = A(BAv)=kAv,
+        so Av is an eigenvector of AB with eigenvalue k.
+        """
+        input_matrix = self.BA
+        if input_matrix.dtype in [torch.bfloat16, torch.float16]:
+            # Cast to float32 because eig is not implemented for 16-bit on CPU/CUDA
+            input_matrix = input_matrix.to(torch.float32)
+        return torch.linalg.eig(input_matrix).eigenvalues
+
+    def _convert_to_slice(self, sequence: Union[Tuple, List], idx: int) -> Tuple:
+        """
+        e.g. if sequence = (1, 2, 3) and idx = 1, return (1, slice(2, 3), 3). This only edits elements if they are ints.
+        """
+        if isinstance(idx, int):
+            sequence = list(sequence)
+            if isinstance(sequence[idx], int):
+                value = sequence[idx]
+                # `value + 1` selects the single requested element, except when
+                # value == -1: there `value + 1 == 0` yields the empty slice(-1, 0).
+                # Use `None` as the stop so the final element is kept.
+                stop = value + 1 if value != -1 else None
+                sequence[idx] = slice(value, stop)
+            sequence = tuple(sequence)
+
+        return sequence
+
+    def __getitem__(self, idx: Union[int, Tuple]) -> FactoredMatrix:
+        """Indexing - assumed to only apply to the leading dimensions."""
+        if not isinstance(idx, tuple):
+            idx = (idx,)
+        length = len([i for i in idx if i is not None])
+        if length <= len(self.shape) - 2:
+            return FactoredMatrix(self.A[idx], self.B[idx])
+        elif length == len(self.shape) - 1:
+            idx = self._convert_to_slice(idx, -1)
+            return FactoredMatrix(self.A[idx], self.B[idx[:-1]])
+        elif length == len(self.shape):
+            idx = self._convert_to_slice(idx, -1)
+            idx = self._convert_to_slice(idx, -2)
+            return FactoredMatrix(self.A[idx[:-1]], self.B[idx[:-2] + (slice(None), idx[-1])])
+        else:
+            raise ValueError(
+                f"{idx} is too long an index for a FactoredMatrix with shape {self.shape}"
+            )
+
+    def norm(self) -> Float[torch.Tensor, "*leading_dims"]:
+        """
+        Frobenius norm is sqrt(sum of squared singular values)
+        """
+        return self.S.pow(2).sum(-1).sqrt()
+
+    def __repr__(self):
+        return f"FactoredMatrix: Shape({self.shape}), Hidden Dim({self.mdim})"
+
+    def make_even(self) -> FactoredMatrix:
+        """
+        Returns the factored form of (U @ S.sqrt().diag(), S.sqrt().diag() @ V.T) where U, S, V are the SVD of the matrix. This is an equivalent factorisation, but more even - each half has half the singular values, and orthogonal rows/cols
+        """
+        return FactoredMatrix(
+            self.U * self.S.sqrt()[..., None, :],
+            self.S.sqrt()[..., :, None] * tensor_utils.transpose(self.V),
+        )
+
+    def get_corner(self, k=3):
+        return tensor_utils.get_corner(self.A[..., :k, :] @ self.B[..., :, :k], k)
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    def collapse_l(self) -> Float[torch.Tensor, "*leading_dims mdim rdim"]:
+        """
+        Collapses the left side of the factorization by removing the orthogonal factor (given by self.U). Returns a (..., mdim, rdim) tensor
+        """
+        return self.S[..., :, None] * tensor_utils.transpose(self.V)
+
+    def collapse_r(self) -> Float[torch.Tensor, "*leading_dims ldim mdim"]:
+        """
+        Analogous to collapse_l, returns a (..., ldim, mdim) tensor
+        """
+        return self.U * self.S[..., None, :]
+
+    def unsqueeze(self, k: int) -> FactoredMatrix:
+        return FactoredMatrix(self.A.unsqueeze(k), self.B.unsqueeze(k))
+
+    @property
+    def pair(
+        self,
+    ) -> Tuple[
+        Float[torch.Tensor, "*leading_dims ldim mdim"],
+        Float[torch.Tensor, "*leading_dims mdim rdim"],
+    ]:
+        return (self.A, self.B)

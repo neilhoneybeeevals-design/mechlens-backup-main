@@ -1,0 +1,201 @@
+import pytest
+import torch
+from torch import randn
+
+from transformer_lens import FactoredMatrix, utils
+
+
+@pytest.fixture(scope="module")
+def random_matrices():
+    return [
+        (randn(3, 2), randn(2, 3)),
+        (randn(4, 5), randn(5, 4)),
+        (randn(6, 7), randn(7, 6)),
+        (randn(6, 7), randn(7, 3)),
+    ]
+
+
+@pytest.fixture(scope="module")
+def factored_matrices(random_matrices):
+    return [FactoredMatrix(a, b) for a, b in random_matrices]
+
+
+@pytest.fixture(scope="module")
+def random_matrices_leading_ones():
+    return [
+        (randn(1, 8, 9), randn(1, 9, 8)),
+    ]
+
+
+@pytest.fixture(scope="module")
+def factored_matrices_leading_ones(random_matrices_leading_ones):
+    return [FactoredMatrix(a, b) for a, b in random_matrices_leading_ones]
+
+
+@pytest.fixture(scope="module")
+def random_matrices_bf16():
+    return [
+        (randn(3, 2).to(torch.bfloat16), randn(2, 3).to(torch.bfloat16)),
+        (randn(10, 4).to(torch.bfloat16), randn(4, 10).to(torch.bfloat16)),
+    ]
+
+
+@pytest.fixture(scope="module")
+def factored_matrices_bf16(random_matrices_bf16):
+    return [FactoredMatrix(a, b) for a, b in random_matrices_bf16]
+
+
+class TestFactoredMatrixProperties:
+    def test_AB_property(self, factored_matrices, random_matrices):
+        for i, factored_matrix in enumerate(factored_matrices):
+            a, b = random_matrices[i]
+            expected_AB = a @ b
+            assert torch.allclose(factored_matrix.AB, expected_AB, atol=1e-5)
+
+    def test_BA_property(self, factored_matrices, random_matrices):
+        for i, factored_matrix in enumerate(factored_matrices):
+            a, b = random_matrices[i]
+            if a.shape[-2] == b.shape[-1]:
+                expected_BA = b @ a
+                assert torch.allclose(factored_matrix.BA, expected_BA, atol=1e-5)
+            else:
+                with pytest.raises(AssertionError):
+                    _ = factored_matrix.BA
+
+    def test_transpose_property(self, factored_matrices):
+        for factored_matrix in factored_matrices:
+            transposed_factored_matrix = factored_matrix.T
+            assert torch.allclose(
+                transposed_factored_matrix.A,
+                factored_matrix.B.transpose(-2, -1),
+                atol=1e-5,
+            )
+            assert torch.allclose(
+                transposed_factored_matrix.B,
+                factored_matrix.A.transpose(-2, -1),
+                atol=1e-5,
+            )
+
+    def test_svd_property(self, factored_matrices):
+        for factored_matrix in factored_matrices:
+            U, S, V = factored_matrix.svd()
+            assert torch.allclose(factored_matrix.AB, U @ torch.diag_embed(S) @ V.T, atol=1e-5)
+            # test that U and V are unitary
+            assert torch.allclose(U.T @ U, torch.eye(U.shape[-1]), atol=1e-5)
+            assert torch.allclose(V.T @ V, torch.eye(V.shape[-1]), atol=1e-5)
+
+    def test_svd_property_leading_ones(self, factored_matrices_leading_ones):
+        for factored_matrix in factored_matrices_leading_ones:
+            U, S, V = factored_matrix.svd()
+            assert torch.allclose(factored_matrix.AB, U @ torch.diag_embed(S) @ V.mT, atol=1e-5)
+            # test that U and V are unitary
+            assert torch.allclose(U.mT @ U, torch.eye(U.shape[-1]), atol=1e-5)
+            assert torch.allclose(V.mT @ V, torch.eye(V.shape[-1]), atol=1e-5)
+
+    def test_V_and_Vh_alias_match(self, factored_matrices):
+        import warnings
+
+        for factored_matrix in factored_matrices:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                vh_value = factored_matrix.Vh
+            assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+            assert torch.equal(vh_value, factored_matrix.V)
+
+    def test_svd_caches_per_instance(self):
+        """svd() should cache its result on the instance — repeated calls return the same tensors."""
+        m = FactoredMatrix(randn(4, 3), randn(3, 4))
+        first_U, first_S, first_V = m.svd()
+        second_U, second_S, second_V = m.svd()
+        assert first_U is second_U
+        assert first_S is second_S
+        assert first_V is second_V
+
+    def test_svd_does_not_prevent_gc(self):
+        """svd's cache must not hold a strong reference that prevents the instance from being GC'd"""
+        import gc
+        import weakref
+
+        m = FactoredMatrix(randn(4, 3), randn(3, 4))
+        _ = m.svd()  # populate the cache
+        ref = weakref.ref(m)
+        del m
+        gc.collect()
+        assert (
+            ref() is None
+        ), "FactoredMatrix instance survived deletion — svd cache is leaking references."
+
+    def test_eigenvalues_property(self, factored_matrices):
+        for factored_matrix in factored_matrices:
+            if factored_matrix.ldim == factored_matrix.rdim:
+                eigenvalues = factored_matrix.eigenvalues
+                expected_eigenvalues = torch.linalg.eig(
+                    factored_matrix.B @ factored_matrix.A
+                ).eigenvalues
+                assert torch.allclose(
+                    torch.abs(eigenvalues), torch.abs(expected_eigenvalues), atol=1e-5
+                )
+            else:
+                with pytest.raises(AssertionError):
+                    _ = factored_matrix.eigenvalues
+
+    def test_ndim_property(self, factored_matrices, random_matrices):
+        for i, factored_matrix in enumerate(factored_matrices):
+            a, b = random_matrices[i]
+            expected_ndim = max(a.ndim, b.ndim)
+            assert factored_matrix.ndim == expected_ndim
+
+    def test_pair_property(self, factored_matrices, random_matrices):
+        for i, factored_matrix in enumerate(factored_matrices):
+            a, b = random_matrices[i]
+            assert torch.allclose(factored_matrix.pair[0], a, atol=1e-5)
+            assert torch.allclose(factored_matrix.pair[1], b, atol=1e-5)
+
+    def test_norm_property(self, factored_matrices):
+        for factored_matrix in factored_matrices:
+            assert torch.allclose(factored_matrix.norm(), factored_matrix.AB.norm(), atol=1e-5)
+
+    def test_get_corner(self, factored_matrices):
+        for factored_matrix in factored_matrices:
+            k = 3
+            result = factored_matrix.get_corner(k)
+            # Effect: get_corner(k) returns the top-left k x k corner of the
+            # full product AB, computed without materializing all of AB.
+            full_product = factored_matrix.AB
+            expected = full_product[tuple(slice(k) for _ in range(full_product.ndim))]
+            assert result.shape == expected.shape
+            assert torch.allclose(result, expected, atol=1e-5)
+
+    def test_collapse_l(self, factored_matrices):
+        for factored_matrix in factored_matrices:
+            result = factored_matrix.collapse_l()
+            # Effect: collapse_l drops only the orthogonal left factor U, so
+            # re-applying U must reconstruct the full product AB.
+            reconstructed = factored_matrix.U @ result
+            assert torch.allclose(reconstructed, factored_matrix.AB, atol=1e-4)
+
+    def test_collapse_r(self, factored_matrices):
+        for factored_matrix in factored_matrices:
+            result = factored_matrix.collapse_r()
+            # Effect: collapse_r drops only the orthogonal right factor V, so
+            # re-applying V.T must reconstruct the full product AB.
+            reconstructed = result @ utils.transpose(factored_matrix.V)
+            assert torch.allclose(reconstructed, factored_matrix.AB, atol=1e-4)
+
+    def test_eigenvalues_bfloat16_support(self, factored_matrices_bf16):
+        """
+        Test that eigenvalues calculation does nott crash for bfloat16 matrices.
+        """
+        for factored_matrix in factored_matrices_bf16:
+            if factored_matrix.ldim == factored_matrix.rdim:
+                eigenvalues = factored_matrix.eigenvalues
+
+                assert eigenvalues.dtype == torch.complex64
+
+                expected_eigenvalues = torch.linalg.eig(
+                    factored_matrix.BA.to(torch.float32)
+                ).eigenvalues
+
+                assert torch.allclose(
+                    torch.abs(eigenvalues), torch.abs(expected_eigenvalues), atol=1e-2, rtol=1e-2
+                )
