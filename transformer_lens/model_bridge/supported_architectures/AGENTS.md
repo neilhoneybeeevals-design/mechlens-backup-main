@@ -122,7 +122,7 @@ Default is a no-op pass-through. Override when a numerical op HF applies nativel
 
 Examples:
 
-- **Cohere** — `cfg.logit_scale` (default `0.0625`) folds into `unembed.weight`. HF forward multiplies logits by `logit_scale`; compat-mode doesn't.
+- **Cohere** — `cfg.logit_scale` (default `0.0625`) folds into `unembed.weight`. `CohereForCausalLM.forward` multiplies logits by `self.logit_scale`, and the bridge forward calls that method in compatibility mode too, so the adapter's `finalize_weight_processing` resets `hf_model.logit_scale` to `1.0` once the fold is written.
 - **Phi-3, InternLM2, Baichuan** — LayerNorm folding done manually here because a fused projection rules out the standard fold.
 
 Counter-example: **Gemma1/2/3** scale embeddings by `√d_model` in `GemmaTextScaledWordEmbedding.forward`, but do **not** fold. The wrapped module applies the scale on every path, so `gemma1.py` / `gemma2.py` / `gemma3.py` say explicitly that weights must not be pre-scaled.
