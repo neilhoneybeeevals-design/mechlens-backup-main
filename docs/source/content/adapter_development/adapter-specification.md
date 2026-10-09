@@ -245,6 +245,10 @@ def setup_component_testing(self, hf_model, bridge_model=None):
 
 Apply architecture-specific weight transformations before standard processing. Example: Cohere folds `logit_scale` into `unembed.weight`. (Gemma's `sqrt(d_model)` embedding scale is applied at runtime by the wrapped HF embedding module and is not folded.)
 
+### `finalize_weight_processing(hf_model)`
+
+Called at the end of `TransformerBridge.process_weights`, after the processed weights have been written back into the wrapped model. The default is a no-op. Override it when `preprocess_weights` folds an operation that the HF forward also applies from a runtime attribute: the bridge forward still runs the HF model's own `forward`, so without this the operation is applied twice. Example: Cohere folds `logit_scale` into `unembed.weight` and then sets `hf_model.logit_scale = 1.0` here.
+
 ### `prepare_loading(model_name, model_kwargs)`
 
 Called before `from_pretrained()`. Use to patch HF model classes.

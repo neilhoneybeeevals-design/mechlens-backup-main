@@ -64,6 +64,7 @@ Optional overrides on the class:
 
 - `default_cfg` — class-level defaults merged into the runtime config
 - `preprocess_weights()` — pre-load weight transforms (e.g. Cohere `logit_scale` fold, Phi-3 / InternLM2 / Baichuan manual LN fold). See [When to override `preprocess_weights`](#when-to-override-preprocess_weights).
+- `finalize_weight_processing()` — runs after processed weights are written back; neutralizes a runtime op that `preprocess_weights` folded (Cohere resets `hf_model.logit_scale`). Default no-op.
 - `applicable_phases` — subset of `[1, 2, 3, 4, 7, 8]` (default `[1, 2, 3, 4]`); see [tools/model_registry/AGENTS.md](../../tools/model_registry/AGENTS.md) for what each phase tests
 - `supports_generation` — set `False` for encoder-only models (BERT, HuBERT)
 

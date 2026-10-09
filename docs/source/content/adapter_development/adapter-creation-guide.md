@@ -177,6 +177,7 @@ Implement only the ones you need:
 
 - **`setup_component_testing(hf_model, bridge_model=None)`** — required for RoPE models, to wire the rotary embedding instance through to the attention bridges. Skip for models with standard positional embeddings.
 - **`preprocess_weights(state_dict)`** — for arch-specific weight transforms before standard processing (e.g., Cohere folds `logit_scale` into `unembed.weight`).
+- **`finalize_weight_processing(hf_model)`** — runs after processed weights are written back; use it to switch off a runtime operation that `preprocess_weights` has folded into the weights (e.g., Cohere resets `hf_model.logit_scale` to `1.0`).
 - **`prepare_loading(model_name, model_kwargs)`** — patch HF model classes before `from_pretrained()`.
 - **`prepare_model(hf_model)`** — post-load fixups before bridge creation.
 
