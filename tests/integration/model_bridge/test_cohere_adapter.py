@@ -60,8 +60,15 @@ def cohere_bridge_processed():
 
 @pytest.fixture(scope="module")
 def cohere_hf() -> Any:
-    """Load the raw HF model for side-by-side comparisons."""
-    return AutoModelForCausalLM.from_pretrained(MODEL).eval()
+    """Load the raw HF model for side-by-side comparisons.
+
+    Pinned to float32 + eager to match the bridge. from_pretrained defaults to
+    dtype="auto", and this checkpoint's config declares float16, so an unpinned
+    reference would be compared against the float32 bridge across dtypes.
+    """
+    return AutoModelForCausalLM.from_pretrained(
+        MODEL, torch_dtype=torch.float32, attn_implementation="eager"
+    ).eval()
 
 
 # ---------------------------------------------------------------------------
